@@ -1,0 +1,11 @@
+{
+  "name": "lypo-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "engines": { "node": ">=18" },
+  "scripts": { "start": "node index.js" },
+  "dependencies": {
+    "express": "^4.19.2",
+    "replicate": "^0.29.0"
+  }
+}
