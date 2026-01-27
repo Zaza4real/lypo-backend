@@ -15,6 +15,7 @@ app.use((req, res, next) => {
   next();
 });
 
+const { REPLICATE_MODEL_VERSION } = process.env;
 const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
 
 // S3/R2 env
@@ -114,9 +115,13 @@ app.post("/api/dub-upload", (req, res) => {
       const base = PUBLIC_BASE_URL.replace(/\/$/, "");
       const videoUrl = `${base}/${key}`;
 
-      const prediction = await replicate.predictions.create({
-        model: "heygen/video-translate",
-        input: { video: videoUrl, output_language: outputLanguage }
+if (!REPLICATE_MODEL_VERSION) {
+  return res.status(500).json({ error: "Missing REPLICATE_MODEL_VERSION env var" });
+}
+
+const prediction = await replicate.predictions.create({
+  version: REPLICATE_MODEL_VERSION,
+  input: { video: videoUrl, output_language: outputLanguage }
       });
 
       const jobId = crypto.randomUUID();
