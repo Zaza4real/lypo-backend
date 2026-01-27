@@ -227,7 +227,6 @@ app.get("/api/dub/:id", async (req, res) => {
         Object.values(out).find((x) => typeof x === "string") ||
         null;
     }
-
     res.json({
       status: prediction.status,
       outputUrl,
