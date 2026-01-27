@@ -19,12 +19,12 @@ const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
 
 // S3/R2 env
 const {
-  S3_ENDPOINT,
-  S3_REGION = "auto",
-  S3_ACCESS_KEY_ID,
-  S3_SECRET_ACCESS_KEY,
-  S3_BUCKET,
-  PUBLIC_BASE_URL
+S3_ENDPOINT = https://bd93392e54a05c1d6ddbc963fc05d7eb.eu.r2.cloudflarestorage.com
+S3_REGION = auto
+S3_ACCESS_KEY_ID = 5dd3a2aab1e182cfd4b9e7665d414e12
+S3_SECRET_ACCESS_KEY = 87668a55ec8302fecb0aae83bbea590c027bbb724f4dd0b4ce023f1601359f35
+S3_BUCKET = lypo-videos
+PUBLIC_BASE_URL = https://pub-a6fab564a3874df9920cf82103b5843d.r2.dev
 } = process.env;
 
 const s3 = new S3Client({
