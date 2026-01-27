@@ -4,7 +4,7 @@ import Replicate from "replicate";
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// Basic CORS (ok for a public demo; tighten later)
+// Basic CORS for a public demo (tighten later if you want)
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -13,122 +13,94 @@ app.use((req, res, next) => {
   next();
 });
 
-const {
-  REPLICATE_API_TOKEN,
-  REPLICATE_MODEL_VERSION,
-  // Optional: if your chosen model uses different input keys:
-  // REPLICATE_VIDEO_KEY = "video",
-  // REPLICATE_LANG_KEY  = "target_language"
-  REPLICATE_VIDEO_KEY = "video",
-  REPLICATE_LANG_KEY = "target_language"
-} = process.env;
+const replicate = new Replicate({
+  auth: process.env.REPLICATE_API_TOKEN,
+});
 
-if (!REPLICATE_API_TOKEN) {
-  console.error("Missing REPLICATE_API_TOKEN env var");
-}
-if (!REPLICATE_MODEL_VERSION) {
-  console.error("Missing REPLICATE_MODEL_VERSION env var");
-}
-
-const replicate = new Replicate({ auth: REPLICATE_API_TOKEN });
-
-// Simple in-memory job store (fine for a demo). For production, use a DB/Redis.
-const jobs = new Map(); // jobId -> { predictionId }
+// In-memory store: jobId -> predictionId
+// (OK for demo. For production, use Redis/DB.)
+const jobs = new Map();
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 /**
  * POST /api/dub
  * Body:
- *  { videoUrl: "https://...", targetLanguage: "es", keepVoice: true, lipsync: true }
+ *  {
+ *    videoUrl: "https://...mp4",
+ *    targetLanguage: "Spanish"
+ *  }
  *
- * NOTE: The exact input schema depends on the Replicate model you choose.
- * We map videoUrl -> input[REPLICATE_VIDEO_KEY]
- * and targetLanguage -> input[REPLICATE_LANG_KEY]
+ * heygen/video-translate expects:
+ *  { video: <url>, output_language: <language name> }
  */
 app.post("/api/dub", async (req, res) => {
   try {
-    const { videoUrl, targetLanguage, keepVoice = true, lipsync = true } = req.body || {};
+    const { videoUrl, targetLanguage } = req.body || {};
 
     if (!videoUrl || !targetLanguage) {
       return res.status(400).json({ error: "videoUrl and targetLanguage are required" });
     }
-    if (!REPLICATE_MODEL_VERSION) {
-      return res.status(500).json({ error: "Server missing REPLICATE_MODEL_VERSION" });
-    }
 
-    const input = {
-      [REPLICATE_VIDEO_KEY]: videoUrl,
-      [REPLICATE_LANG_KEY]: targetLanguage,
-      // These may or may not exist on your chosen model; harmless if ignored by your own mapping
-      keep_voice: keepVoice,
-      lipsync: lipsync
-    };
-
-    // Create a prediction (async job)
+    // Create prediction for heygen/video-translate
     const prediction = await replicate.predictions.create({
-      version: REPLICATE_MODEL_VERSION,
-      input
-      // Optional: webhooks are great for production
-      // webhook: "https://your-backend.onrender.com/api/replicate/webhook",
-      // webhook_events_filter: ["start", "completed"]
+      model: "heygen/video-translate",
+      input: {
+        video: videoUrl,
+        output_language: targetLanguage
+      }
     });
 
     const jobId = crypto.randomUUID();
-    jobs.set(jobId, { predictionId: prediction.id });
+    jobs.set(jobId, prediction.id);
 
     res.json({
       id: jobId,
       predictionId: prediction.id,
-      status: prediction.status,
-      // helpful for debugging:
-      inputSent: input
+      status: prediction.status
     });
   } catch (err) {
-    console.error(err);
     res.status(500).json({ error: err?.message || "Internal error" });
   }
 });
 
 /**
  * GET /api/dub/:id
- * Returns a normalized status + outputUrl when available.
- * Poll this from the frontend.
+ * Returns normalized:
+ *  { status, outputUrl, error, logs }
+ *
+ * Output may be a FileOutput object (has url()).
+ * Replicate docs show how output file objects work in JS. :contentReference[oaicite:3]{index=3}
  */
 app.get("/api/dub/:id", async (req, res) => {
   try {
-    const job = jobs.get(req.params.id);
-    if (!job) return res.status(404).json({ error: "Job not found" });
+    const predictionId = jobs.get(req.params.id);
+    if (!predictionId) return res.status(404).json({ error: "Job not found" });
 
-    const prediction = await replicate.predictions.get(job.predictionId);
+    const prediction = await replicate.predictions.get(predictionId);
 
-    // Normalize output into a single URL if the model returns files/urls
     let outputUrl = null;
+
+    // For this model, output is typically a file-like object.
+    // If it supports .url() (FileOutput), use it.
     const out = prediction.output;
 
-    // output could be a string URL, array of URLs, or an object containing URLs
-    if (typeof out === "string") outputUrl = out;
-    else if (Array.isArray(out)) outputUrl = out.find((x) => typeof x === "string") || null;
-    else if (out && typeof out === "object") {
-      // common patterns: { video: "..."} or { output: "..."}
-      outputUrl =
-        out.video ||
-        out.output ||
-        Object.values(out).find((x) => typeof x === "string") ||
-        null;
+    if (out && typeof out === "object" && typeof out.url === "function") {
+      outputUrl = out.url();
+    } else if (typeof out === "string") {
+      outputUrl = out;
     }
 
     res.json({
-      status: prediction.status, // "starting" | "processing" | "succeeded" | "failed" etc.
+      status: prediction.status,
       outputUrl,
       error: prediction.error || null,
       logs: prediction.logs || null
     });
   } catch (err) {
-    console.error(err);
     res.status(500).json({ error: err?.message || "Internal error" });
   }
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`LYPO backend listening on ${port}`));
+app.listen(port, () => console.log(`LYPO backend running on ${port}`));
