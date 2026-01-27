@@ -6,7 +6,9 @@ import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 
 const app = express();
 
-// CORS for public demo
+/* ---------------------------
+   CORS (demo-friendly)
+---------------------------- */
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -15,11 +17,12 @@ app.use((req, res, next) => {
   next();
 });
 
-const { REPLICATE_MODEL_VERSION } = process.env;
-const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
-
-// S3/R2 env
+/* ---------------------------
+   ENV
+---------------------------- */
 const {
+  REPLICATE_API_TOKEN,
+  REPLICATE_MODEL_VERSION, // <-- REQUIRED (this fixes the 422)
   S3_ENDPOINT,
   S3_REGION = "auto",
   S3_ACCESS_KEY_ID,
@@ -28,18 +31,64 @@ const {
   PUBLIC_BASE_URL
 } = process.env;
 
+function requireEnv(name, value) {
+  if (!value) {
+    const err = new Error(`Missing env var: ${name}`);
+    err.statusCode = 500;
+    throw err;
+  }
+  return value;
+}
+
+/* ---------------------------
+   Replicate client
+---------------------------- */
+const replicate = new Replicate({
+  auth: REPLICATE_API_TOKEN
+});
+
+/* ---------------------------
+   S3/R2 client
+---------------------------- */
 const s3 = new S3Client({
   region: S3_REGION,
   endpoint: S3_ENDPOINT,
   credentials: {
-    accessKeyId: S3_ACCESS_KEY_ID,
-    secretAccessKey: S3_SECRET_ACCESS_KEY
+    accessKeyId: S3_ACCESS_KEY_ID || "",
+    secretAccessKey: S3_SECRET_ACCESS_KEY || ""
   }
 });
 
-// jobId -> predictionId
+/* ---------------------------
+   In-memory jobs (demo)
+   jobId -> predictionId
+---------------------------- */
 const jobs = new Map();
 
+/* ---------------------------
+   Helper: create prediction
+   IMPORTANT: uses version, never model
+---------------------------- */
+async function createHeygenPrediction({ videoUrl, outputLanguage }) {
+  const version = requireEnv("REPLICATE_MODEL_VERSION", REPLICATE_MODEL_VERSION);
+  requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
+
+  // Debug (keep for now; remove later)
+  console.log("Creating Replicate prediction with version:", version);
+  console.log("Input:", { video: videoUrl, output_language: outputLanguage });
+
+  return replicate.predictions.create({
+    version,
+    input: {
+      video: videoUrl,
+      output_language: outputLanguage
+    }
+  });
+}
+
+/* ---------------------------
+   Routes
+---------------------------- */
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 app.get("/api/languages", (_req, res) => {
@@ -56,87 +105,106 @@ app.get("/api/languages", (_req, res) => {
   });
 });
 
-// Upload -> S3/R2 -> Replicate prediction
+/**
+ * POST /api/dub-upload
+ * multipart/form-data:
+ *  - video: (file)
+ *  - output_language: (string e.g. "Spanish")
+ */
 app.post("/api/dub-upload", (req, res) => {
-  const missing =
-    !process.env.REPLICATE_API_TOKEN ||
-    !S3_ENDPOINT || !S3_ACCESS_KEY_ID || !S3_SECRET_ACCESS_KEY || !S3_BUCKET || !PUBLIC_BASE_URL;
+  try {
+    // Validate env vars early (gives clear errors)
+    requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
+    requireEnv("REPLICATE_MODEL_VERSION", REPLICATE_MODEL_VERSION);
+    requireEnv("S3_ENDPOINT", S3_ENDPOINT);
+    requireEnv("S3_ACCESS_KEY_ID", S3_ACCESS_KEY_ID);
+    requireEnv("S3_SECRET_ACCESS_KEY", S3_SECRET_ACCESS_KEY);
+    requireEnv("S3_BUCKET", S3_BUCKET);
+    requireEnv("PUBLIC_BASE_URL", PUBLIC_BASE_URL);
 
-  if (missing) {
-    return res.status(500).json({
-      error:
-        "Missing env vars. Need REPLICATE_API_TOKEN and S3_ENDPOINT,S3_ACCESS_KEY_ID,S3_SECRET_ACCESS_KEY,S3_BUCKET,PUBLIC_BASE_URL"
+    const bb = Busboy({
+      headers: req.headers,
+      limits: { fileSize: 500 * 1024 * 1024 } // 500MB
     });
-  }
 
-  const bb = Busboy({ headers: req.headers, limits: { fileSize: 500 * 1024 * 1024 } });
+    let outputLanguage = null;
 
-  let outputLanguage = null;
-  let fileBufferChunks = [];
-  let fileInfo = null;
+    let fileInfo = null;
+    let chunks = [];
 
-  bb.on("field", (name, val) => {
-    if (name === "output_language") outputLanguage = val;
-  });
-
-  bb.on("file", (name, file, info) => {
-    if (name !== "video") {
-      file.resume();
-      return;
-    }
-    fileInfo = info;
-
-    file.on("data", (d) => fileBufferChunks.push(d));
-    file.on("limit", () => {
-      // file too big
-      fileBufferChunks = [];
+    bb.on("field", (name, val) => {
+      if (name === "output_language") outputLanguage = val;
     });
-  });
 
-  bb.on("finish", async () => {
-    try {
-      if (!fileInfo) return res.status(400).json({ error: "Missing video file (field name: video)" });
-      if (!outputLanguage) return res.status(400).json({ error: "Missing output_language" });
+    bb.on("file", (name, file, info) => {
+      if (name !== "video") {
+        file.resume();
+        return;
+      }
 
-      const body = Buffer.concat(fileBufferChunks);
-      if (!body.length) return res.status(400).json({ error: "Empty upload or file too large" });
+      fileInfo = info;
+      chunks = [];
 
-      const filename = fileInfo.filename || "video.mp4";
-      const ext = (filename.split(".").pop() || "mp4").toLowerCase();
-      const key = `uploads/${crypto.randomUUID()}.${ext}`;
-
-      await s3.send(new PutObjectCommand({
-        Bucket: S3_BUCKET,
-        Key: key,
-        Body: body,
-        ContentType: fileInfo.mimeType || "video/mp4"
-      }));
-
-      const base = PUBLIC_BASE_URL.replace(/\/$/, "");
-      const videoUrl = `${base}/${key}`;
-
-if (!REPLICATE_MODEL_VERSION) {
-  return res.status(500).json({ error: "Missing REPLICATE_MODEL_VERSION env var" });
-}
-
-const prediction = await replicate.predictions.create({
-  version: REPLICATE_MODEL_VERSION,
-  input: { video: videoUrl, output_language: outputLanguage }
+      file.on("data", (d) => chunks.push(d));
+      file.on("limit", () => {
+        chunks = [];
       });
+    });
 
-      const jobId = crypto.randomUUID();
-      jobs.set(jobId, prediction.id);
+    bb.on("finish", async () => {
+      try {
+        if (!fileInfo) return res.status(400).json({ error: "Missing video file (field name: video)" });
+        if (!outputLanguage) return res.status(400).json({ error: "Missing output_language" });
 
-      res.json({ id: jobId, predictionId: prediction.id, status: prediction.status, uploadedUrl: videoUrl });
-    } catch (e) {
-      res.status(500).json({ error: e?.message || "Upload/Start failed" });
-    }
-  });
+        const body = Buffer.concat(chunks);
+        if (!body.length) return res.status(400).json({ error: "Empty upload or file too large" });
 
-  req.pipe(bb);
+        const original = fileInfo.filename || "video.mp4";
+        const ext = (original.split(".").pop() || "mp4").toLowerCase();
+        const key = `uploads/${crypto.randomUUID()}.${ext}`;
+
+        await s3.send(new PutObjectCommand({
+          Bucket: S3_BUCKET,
+          Key: key,
+          Body: body,
+          ContentType: fileInfo.mimeType || "video/mp4"
+        }));
+
+        const base = PUBLIC_BASE_URL.replace(/\/$/, "");
+        const videoUrl = `${base}/${key}`;
+
+        // ✅ Create prediction (version-based)
+        const prediction = await createHeygenPrediction({
+          videoUrl,
+          outputLanguage
+        });
+
+        const jobId = crypto.randomUUID();
+        jobs.set(jobId, prediction.id);
+
+        res.json({
+          id: jobId,
+          predictionId: prediction.id,
+          status: prediction.status,
+          uploadedUrl: videoUrl
+        });
+      } catch (e) {
+        console.error(e);
+        res.status(e.statusCode || 500).json({ error: e?.message || "Upload/Start failed" });
+      }
+    });
+
+    req.pipe(bb);
+  } catch (e) {
+    console.error(e);
+    res.status(e.statusCode || 500).json({ error: e?.message || "Internal error" });
+  }
 });
 
-// Poll prediction
+/**
+ * GET /api/dub/:id
+ * Poll prediction status + outputUrl when ready
+ */
 app.get("/api/dub/:id", async (req, res) => {
   try {
     const predictionId = jobs.get(req.params.id);
@@ -147,9 +215,14 @@ app.get("/api/dub/:id", async (req, res) => {
     let outputUrl = null;
     const out = prediction.output;
 
-    // If output is a file-like object with url()
-    if (out && typeof out === "object" && typeof out.url === "function") outputUrl = out.url();
-    else if (typeof out === "string") outputUrl = out;
+    // Replicate output may be file-like (url()), string, etc.
+    if (out && typeof out === "object" && typeof out.url === "function") {
+      outputUrl = out.url();
+    } else if (typeof out === "string") {
+      outputUrl = out;
+    } else if (Array.isArray(out)) {
+      outputUrl = out.find((x) => typeof x === "string") || null;
+    }
 
     res.json({
       status: prediction.status,
@@ -158,6 +231,7 @@ app.get("/api/dub/:id", async (req, res) => {
       logs: prediction.logs || null
     });
   } catch (e) {
+    console.error(e);
     res.status(500).json({ error: e?.message || "Internal error" });
   }
 });
