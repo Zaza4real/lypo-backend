@@ -1,5 +1,26 @@
 import express from "express";
 import Replicate from "replicate";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import Busboy from "busboy";
+import crypto from "crypto";
+
+const {
+  S3_ENDPOINT,
+  S3_REGION = "auto",
+  S3_ACCESS_KEY_ID,
+  S3_SECRET_ACCESS_KEY,
+  S3_BUCKET,
+  PUBLIC_BASE_URL // e.g. https://<your-public-domain-or-r2-public-url>/
+} = process.env;
+
+const s3 = new S3Client({
+  region: S3_REGION,
+  endpoint: S3_ENDPOINT,
+  credentials: {
+    accessKeyId: S3_ACCESS_KEY_ID,
+    secretAccessKey: S3_SECRET_ACCESS_KEY
+  }
+});
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
