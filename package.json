@@ -2,7 +2,7 @@
   "name": "lypo-backend",
   "version": "1.0.0",
   "type": "module",
-  "engines": { "node": ">=18" },
+  "engines": { "node": "20" },
   "scripts": { "start": "node index.js" },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.637.0",
