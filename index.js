@@ -22,7 +22,7 @@ app.use((req, res, next) => {
 ---------------------------- */
 const {
   REPLICATE_API_TOKEN,
-  REPLICATE_MODEL_VERSION, // <-- REQUIRED (this fixes the 422)
+  REPLICATE_MODEL_VERSION, // REQUIRED
   S3_ENDPOINT,
   S3_REGION = "auto",
   S3_ACCESS_KEY_ID,
@@ -60,20 +60,14 @@ const s3 = new S3Client({
 });
 
 /* ---------------------------
-   In-memory jobs (demo)
-   jobId -> predictionId
----------------------------- */
-const jobs = new Map();
-
-/* ---------------------------
    Helper: create prediction
-   IMPORTANT: uses version, never model
+   IMPORTANT: uses version (never model)
 ---------------------------- */
 async function createHeygenPrediction({ videoUrl, outputLanguage }) {
   const version = requireEnv("REPLICATE_MODEL_VERSION", REPLICATE_MODEL_VERSION);
   requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
 
-  // Debug (keep for now; remove later)
+  // Useful debug logs (safe—no secrets)
   console.log("Creating Replicate prediction with version:", version);
   console.log("Input:", { video: videoUrl, output_language: outputLanguage });
 
@@ -110,10 +104,13 @@ app.get("/api/languages", (_req, res) => {
  * multipart/form-data:
  *  - video: (file)
  *  - output_language: (string e.g. "Spanish")
+ *
+ * Uploads the file to S3/R2, then starts a Replicate prediction.
+ * Returns id = Replicate prediction id (so polling never loses state).
  */
 app.post("/api/dub-upload", (req, res) => {
   try {
-    // Validate env vars early (gives clear errors)
+    // Validate required env vars early for a clean error message
     requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
     requireEnv("REPLICATE_MODEL_VERSION", REPLICATE_MODEL_VERSION);
     requireEnv("S3_ENDPOINT", S3_ENDPOINT);
@@ -128,7 +125,6 @@ app.post("/api/dub-upload", (req, res) => {
     });
 
     let outputLanguage = null;
-
     let fileInfo = null;
     let chunks = [];
 
@@ -148,6 +144,9 @@ app.post("/api/dub-upload", (req, res) => {
       file.on("data", (d) => chunks.push(d));
       file.on("limit", () => {
         chunks = [];
+      });
+      file.on("error", (e) => {
+        console.error("Upload stream error:", e);
       });
     });
 
@@ -173,17 +172,15 @@ app.post("/api/dub-upload", (req, res) => {
         const base = PUBLIC_BASE_URL.replace(/\/$/, "");
         const videoUrl = `${base}/${key}`;
 
-        // ✅ Create prediction (version-based)
         const prediction = await createHeygenPrediction({
           videoUrl,
           outputLanguage
         });
 
-        const jobId = crypto.randomUUID();
-        jobs.set(jobId, prediction.id);
-
+        // ✅ Return Replicate prediction id as the job id.
+        // This avoids “job not found” even if Render restarts.
         res.json({
-          id: jobId,
+          id: prediction.id,
           predictionId: prediction.id,
           status: prediction.status,
           uploadedUrl: videoUrl
@@ -203,25 +200,32 @@ app.post("/api/dub-upload", (req, res) => {
 
 /**
  * GET /api/dub/:id
- * Poll prediction status + outputUrl when ready
+ * Polls Replicate prediction by id (no in-memory state needed).
  */
 app.get("/api/dub/:id", async (req, res) => {
   try {
-    const predictionId = jobs.get(req.params.id);
-    if (!predictionId) return res.status(404).json({ error: "Job not found" });
+    requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
 
+    const predictionId = req.params.id;
     const prediction = await replicate.predictions.get(predictionId);
 
     let outputUrl = null;
     const out = prediction.output;
 
-    // Replicate output may be file-like (url()), string, etc.
+    // Replicate output may be file-like (url()), string, array, etc.
     if (out && typeof out === "object" && typeof out.url === "function") {
       outputUrl = out.url();
     } else if (typeof out === "string") {
       outputUrl = out;
     } else if (Array.isArray(out)) {
       outputUrl = out.find((x) => typeof x === "string") || null;
+    } else if (out && typeof out === "object") {
+      outputUrl =
+        out.url ||
+        out.video ||
+        out.output ||
+        Object.values(out).find((x) => typeof x === "string") ||
+        null;
     }
 
     res.json({
