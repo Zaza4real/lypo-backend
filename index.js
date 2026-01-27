@@ -37,6 +37,20 @@ app.use((req, res, next) => {
 const replicate = new Replicate({
   auth: process.env.REPLICATE_API_TOKEN,
 });
+app.get("/api/languages", (_req, res) => {
+  // You can expand this. Keep it simple for now.
+  res.json({
+    languages: [
+      "English","Spanish","French","German","Italian","Portuguese",
+      "Dutch","Swedish","Norwegian","Danish","Finnish",
+      "Polish","Czech","Slovak","Hungarian","Romanian",
+      "Greek","Turkish","Ukrainian","Russian",
+      "Arabic","Hebrew",
+      "Hindi","Bengali","Urdu",
+      "Chinese","Japanese","Korean","Vietnamese","Thai","Indonesian"
+    ]
+  });
+});
 
 // In-memory store: jobId -> predictionId
 // (OK for demo. For production, use Redis/DB.)
@@ -122,6 +136,94 @@ app.get("/api/dub/:id", async (req, res) => {
     res.status(500).json({ error: err?.message || "Internal error" });
   }
 });
+
+app.post("/api/dub-upload", async (req, res) => {
+  try {
+    if (!S3_ENDPOINT || !S3_ACCESS_KEY_ID || !S3_SECRET_ACCESS_KEY || !S3_BUCKET || !PUBLIC_BASE_URL) {
+      return res.status(500).json({
+        error: "Missing S3/R2 env vars. Set S3_ENDPOINT, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_BUCKET, PUBLIC_BASE_URL."
+      });
+    }
+
+    const bb = Busboy({ headers: req.headers, limits: { fileSize: 500 * 1024 * 1024 } }); // 500MB
+    let outputLanguage = null;
+
+    let uploadPromise = null;
+    let uploadedUrl = null;
+
+    bb.on("field", (name, val) => {
+      if (name === "output_language") outputLanguage = val;
+    });
+
+    bb.on("file", (name, file, info) => {
+      if (name !== "video") {
+        file.resume();
+        return;
+      }
+
+      const { filename, mimeType } = info;
+      const ext = (filename?.split(".").pop() || "mp4").toLowerCase();
+      const key = `uploads/${crypto.randomUUID()}.${ext}`;
+
+      const chunks = [];
+      file.on("data", (d) => chunks.push(d));
+
+      uploadPromise = new Promise((resolve, reject) => {
+        file.on("end", async () => {
+          try {
+            const body = Buffer.concat(chunks);
+
+            await s3.send(new PutObjectCommand({
+              Bucket: S3_BUCKET,
+              Key: key,
+              Body: body,
+              ContentType: mimeType || "video/mp4"
+            }));
+
+            uploadedUrl = PUBLIC_BASE_URL.replace(/\/$/, "") + "/" + key;
+            resolve(uploadedUrl);
+          } catch (e) {
+            reject(e);
+          }
+        });
+
+        file.on("error", reject);
+      });
+    });
+
+    bb.on("finish", async () => {
+      try {
+        if (!uploadPromise) return res.status(400).json({ error: "Missing video file" });
+        if (!outputLanguage) return res.status(400).json({ error: "Missing output_language" });
+
+        const videoUrl = await uploadPromise;
+
+        // Create Replicate prediction with heygen/video-translate
+        const prediction = await replicate.predictions.create({
+          model: "heygen/video-translate",
+          input: { video: videoUrl, output_language: outputLanguage }
+        });
+
+        const jobId = crypto.randomUUID();
+        jobs.set(jobId, prediction.id);
+
+        res.json({
+          id: jobId,
+          predictionId: prediction.id,
+          status: prediction.status,
+          uploadedUrl: videoUrl
+        });
+      } catch (e) {
+        res.status(500).json({ error: e?.message || "Upload/Start failed" });
+      }
+    });
+
+    req.pipe(bb);
+  } catch (e) {
+    res.status(500).json({ error: e?.message || "Internal error" });
+  }
+});
+
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`LYPO backend running on ${port}`));
