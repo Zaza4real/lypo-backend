@@ -75,17 +75,6 @@ async function initDb() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS admin_adjustments (
-      id BIGSERIAL PRIMARY KEY,
-      target_email TEXT NOT NULL,
-      amount_credits INTEGER NOT NULL,
-      reason TEXT,
-      created_by TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-  `);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS videos (
       id BIGSERIAL PRIMARY KEY,
@@ -99,22 +88,9 @@ async function initDb() {
     );
   `);
 }
-}
 
 function normEmail(email) {
   return String(email || "").toLowerCase().trim();
-}
-
-
-function isAdminRequest(req) {
-  const requester = normEmail(req.user?.email || "");
-  const adminEmail = normEmail(process.env.ADMIN_EMAIL || "");
-  const adminSecret = process.env.ADMIN_SECRET || "";
-  const providedSecret = String(req.headers["x-admin-secret"] || "");
-
-  if (adminEmail && requester && requester === adminEmail) return true;
-  if (adminSecret && providedSecret && providedSecret === adminSecret) return true;
-  return false;
 }
 function publicUserRow(r) {
   return { email: r.email, balance: Number(r.balance || 0), createdAt: r.created_at };
@@ -599,39 +575,3 @@ initDb()
     console.error("❌ DB init failed", e);
     process.exit(1);
   });
-
-
-// ---- Admin (top-ups / adjustments)
-app.get("/api/admin/status", auth, (req, res) => {
-  res.json({ isAdmin: isAdminRequest(req) });
-});
-
-app.post("/api/admin/add-credits", auth, async (req, res) => {
-  if (!isAdminRequest(req)) return res.status(403).json({ error: "FORBIDDEN" });
-
-  const targetEmail = normEmail(req.body?.email || "");
-  const amount = Number(req.body?.amount || 0);
-  const reason = String(req.body?.reason || "").slice(0, 500);
-
-  if (!targetEmail) return res.status(400).json({ error: "Missing email" });
-  if (!Number.isFinite(amount) || amount === 0) return res.status(400).json({ error: "Invalid amount" });
-
-  const credits = Math.trunc(amount);
-  if (credits === 0) return res.status(400).json({ error: "Invalid amount" });
-
-  // Require existing user (safety)
-  const { rows: existing } = await pool.query("SELECT email, balance FROM users WHERE email=$1", [targetEmail]);
-  if (!existing[0]) return res.status(404).json({ error: "User not found" });
-
-  const { rows: updated } = await pool.query(
-    "UPDATE users SET balance = balance + $2 WHERE email=$1 RETURNING email, balance",
-    [targetEmail, credits]
-  );
-
-  await pool.query(
-    "INSERT INTO admin_adjustments (target_email, amount_credits, reason, created_by) VALUES ($1,$2,$3,$4)",
-    [targetEmail, credits, reason || null, normEmail(req.user.email)]
-  );
-
-  res.json({ ok: true, user: updated[0], adjustment: { target_email: targetEmail, amount_credits: credits, reason } });
-});
