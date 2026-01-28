@@ -203,33 +203,6 @@ function auth(req, res, next) {
   }
 }
 
-// ---- Admin guard
-// Backend env: ADMIN_EMAILS="admin1@example.com,admin2@example.com"
-function adminAllowSet() {
-  // Support both ADMIN_EMAILS (comma-separated) and legacy ADMIN_EMAIL (single email)
-  const raw = String(process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || "");
-  return new Set(
-    raw
-      .split(",")
-      .map((s) => s.trim().toLowerCase())
-      .filter(Boolean)
-  );
-}
-
-function isAdminEmail(email) {
-  const allow = adminAllowSet();
-  const e = normEmail(email);
-  return !!e && allow.size > 0 && allow.has(e);
-}
-
-function requireAdmin(req, res, next) {
-  const email = normEmail(req.user?.email);
-  if (!isAdminEmail(email)) {
-    return res.status(403).json({ error: "NOT_AUTHORIZED" });
-  }
-  return next();
-}
-
 // Stripe webhook must use RAW body — define BEFORE express.json
 app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   const sig = req.headers["stripe-signature"];
@@ -298,13 +271,6 @@ app.get("/api/auth/me", auth, async (req, res) => {
   const email = req.user?.email;
   const u = await getUserByEmail(email);
   if (!u) return res.status(401).json({ error: "Invalid user" });
-
-// ---- Admin: check if current user is admin
-app.get("/api/admin/status", auth, (req, res) => {
-  const email = normEmail(req.user?.email);
-  return res.json({ isAdmin: isAdminEmail(email), email });
-});
-
   res.json({ user: publicUserRow(u) });
 });
 
@@ -314,35 +280,6 @@ app.get("/api/credits", auth, async (req, res) => {
   const u = await getUserByEmail(email);
   if (!u) return res.status(401).json({ error: "Invalid user" });
   res.json({ balance: Number(u.balance || 0) });
-});
-
-// ---- Admin: add credits to a user
-// Backend env: ADMIN_EMAILS="admin1@example.com,admin2@example.com"
-// POST /api/admin/add-credits { email, amount, reason? }
-app.post("/api/admin/add-credits", auth, requireAdmin, async (req, res) => {
-  const email = normEmail(req.body?.email);
-  const amountRaw = req.body?.amount;
-  const amount = Math.trunc(Number(amountRaw));
-  const reason = String(req.body?.reason || "").slice(0, 300);
-
-  if (!email) return res.status(400).json({ error: "Missing email" });
-  if (!Number.isFinite(amount) || amount === 0) return res.status(400).json({ error: "Invalid amount" });
-
-  const u = await getUserByEmail(email);
-  if (!u) return res.status(404).json({ error: "NO_USER" });
-
-  await addBalance(email, amount);
-  const updated = await getUserByEmail(email);
-
-  // Optional audit trail in logs
-  console.log("✅ Admin added credits", {
-    admin: normEmail(req.user.email),
-    email,
-    amount,
-    reason
-  });
-
-  return res.json({ ok: true, user: publicUserRow(updated) });
 });
 
 app.post("/api/credits/charge", auth, async (req, res) => {
@@ -540,8 +477,8 @@ app.post("/api/dub-upload", auth, (req, res) => {
 
         // Charge credits server-side (authoritative)
         const seconds = Math.max(1, Number(secondsField || 0));
-        const units = Math.max(1, Math.ceil(seconds / 30));
-        const cost = units * PRICE_PER_30S_LYPOS;
+        const secs = Math.max(1, Math.ceil(seconds));
+        const cost = secs * CREDITS_PER_SECOND;
 
         const email = req.user.email;
         const charge = await chargeBalance(email, cost);
