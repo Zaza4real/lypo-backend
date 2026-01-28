@@ -203,6 +203,22 @@ function auth(req, res, next) {
   }
 }
 
+// ---- Admin guard
+// Backend env: ADMIN_EMAILS="admin1@example.com,admin2@example.com"
+function requireAdmin(req, res, next) {
+  const allow = new Set(
+    String(process.env.ADMIN_EMAILS || "")
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean)
+  );
+  const email = normEmail(req.user?.email);
+  if (!email || allow.size === 0 || !allow.has(email)) {
+    return res.status(403).json({ error: "NOT_AUTHORIZED" });
+  }
+  return next();
+}
+
 // Stripe webhook must use RAW body — define BEFORE express.json
 app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   const sig = req.headers["stripe-signature"];
@@ -280,6 +296,35 @@ app.get("/api/credits", auth, async (req, res) => {
   const u = await getUserByEmail(email);
   if (!u) return res.status(401).json({ error: "Invalid user" });
   res.json({ balance: Number(u.balance || 0) });
+});
+
+// ---- Admin: add credits to a user
+// Backend env: ADMIN_EMAILS="admin1@example.com,admin2@example.com"
+// POST /api/admin/add-credits { email, amount, reason? }
+app.post("/api/admin/add-credits", auth, requireAdmin, async (req, res) => {
+  const email = normEmail(req.body?.email);
+  const amountRaw = req.body?.amount;
+  const amount = Math.trunc(Number(amountRaw));
+  const reason = String(req.body?.reason || "").slice(0, 300);
+
+  if (!email) return res.status(400).json({ error: "Missing email" });
+  if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: "Invalid amount" });
+
+  const u = await getUserByEmail(email);
+  if (!u) return res.status(404).json({ error: "NO_USER" });
+
+  await addBalance(email, amount);
+  const updated = await getUserByEmail(email);
+
+  // Optional audit trail in logs
+  console.log("✅ Admin added credits", {
+    admin: normEmail(req.user.email),
+    email,
+    amount,
+    reason
+  });
+
+  return res.json({ ok: true, user: publicUserRow(updated) });
 });
 
 app.post("/api/credits/charge", auth, async (req, res) => {
@@ -476,9 +521,9 @@ app.post("/api/dub-upload", auth, (req, res) => {
         if (!outputLanguage) return res.status(400).json({ error: "Missing output_language" });
 
         // Charge credits server-side (authoritative)
-        // Bill per-second to match the frontend estimate (e.g. 10s => 100 credits when CREDITS_PER_SECOND=10)
-        const seconds = Math.max(1, Math.ceil(Number(secondsField || 0)));
-        const cost = seconds * CREDITS_PER_SECOND;
+        const seconds = Math.max(1, Number(secondsField || 0));
+        const units = Math.max(1, Math.ceil(seconds / 30));
+        const cost = units * PRICE_PER_30S_LYPOS;
 
         const email = req.user.email;
         const charge = await chargeBalance(email, cost);
@@ -511,9 +556,7 @@ app.post("/api/dub-upload", auth, (req, res) => {
           id: prediction.id,
           predictionId: prediction.id,
           status: prediction.status,
-          uploadedUrl: videoUrl,
-          chargedCredits: cost,
-          remainingCredits: charge.balance
+          uploadedUrl: videoUrl
         });
       } catch (e) {
         console.error(e);
