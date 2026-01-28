@@ -228,7 +228,8 @@ try {
   // For one-time payments, Stripe may not create an "invoice". In that case we store the charge receipt URL.
   if (session.invoice) {
     const inv = await stripe.invoices.retrieve(String(session.invoice));
-    invoiceUrl = inv.hosted_invoice_url || inv.invoice_pdf || null;
+    // Prefer a directly downloadable PDF when available.
+    invoiceUrl = inv.invoice_pdf || inv.hosted_invoice_url || null;
   } else if (session.payment_intent) {
     const pi = await stripe.paymentIntents.retrieve(String(session.payment_intent), { expand: ["charges"] });
     const charge = pi?.charges?.data?.[0];
