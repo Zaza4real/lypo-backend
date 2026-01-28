@@ -7,80 +7,9 @@ import Stripe from "stripe";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import pg from "pg";
-
 import { Resend } from "resend";
 
-const resend = new Resend(process.env.RESEND_API_KEY || "");
-const EMAIL_FROM = process.env.EMAIL_FROM || "LYPO <no-reply@digitalgeekworld.com>";
-
 const app = express();
-
-app.use(express.json());
-
-app.post("/api/auth/forgot", async (req, res) => {
-  const email = String(req.body?.email || "").trim().toLowerCase();
-  if (!email) return res.status(400).json({ error: "Email required" });
-
-  // Always respond OK to avoid account enumeration
-  const ok = () => res.json({ ok: true });
-
-  const user = await pool.query("SELECT email FROM users WHERE email=$1", [email]);
-  if (user.rowCount === 0) return ok();
-
-  // generate token + store hash
-  const token = crypto.randomBytes(32).toString("hex");
-  const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
-  const expiresAt = new Date(Date.now() + 30 * 60 * 1000); // 30 min
-
-  await pool.query(
-    `INSERT INTO password_resets (email, token_hash, expires_at)
-     VALUES ($1,$2,$3)`,
-    [email, tokenHash, expiresAt]
-  );
-
-  const resetLink = `${FRONTEND_URL}/auth.html#reset=${token}`;
-
-  // send email via Resend API (no SMTP)
-  await resend.emails.send({
-    from: EMAIL_FROM,
-    to: email,
-    subject: "Reset your LYPO password",
-    html: `
-      <p>We received a request to reset your password.</p>
-      <p><a href="${resetLink}">Reset password</a></p>
-      <p>This link expires in 30 minutes.</p>
-    `
-  });
-
-  return ok();
-});
-app.post("/api/auth/reset", async (req, res) => {
-  const token = String(req.body?.token || "");
-  const newPassword = String(req.body?.newPassword || "");
-
-  if (token.length < 20) return res.status(400).json({ error: "Invalid token" });
-  if (newPassword.length < 8) return res.status(400).json({ error: "Password too short" });
-
-  const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
-
-  const r = await pool.query(
-    `SELECT id, email FROM password_resets
-     WHERE token_hash=$1 AND used=false AND expires_at > now()
-     ORDER BY created_at DESC
-     LIMIT 1`,
-    [tokenHash]
-  );
-  if (r.rowCount === 0) return res.status(400).json({ error: "Token expired or invalid" });
-
-  const email = r.rows[0].email;
-
-  const password_hash = await bcrypt.hash(newPassword, 10);
-
-  await pool.query("UPDATE users SET password_hash=$1 WHERE email=$2", [password_hash, email]);
-  await pool.query("UPDATE password_resets SET used=true WHERE id=$1", [r.rows[0].id]);
-
-  res.json({ ok: true });
-});
 
 /* ---------------------------
    CORS
@@ -119,6 +48,10 @@ const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
 const JWT_SECRET = process.env.JWT_SECRET || "dev_change_me";
 
+// ---- Resend (HTTP email, no SMTP)
+const resend = new Resend(process.env.RESEND_API_KEY || "");
+const EMAIL_FROM = process.env.EMAIL_FROM || "LYPO <no-reply@digitalgeekworld.com>";
+
 // ---- Postgres
 const { Pool } = pg;
 const pool = new Pool({
@@ -135,7 +68,8 @@ async function initDb() {
       balance INTEGER NOT NULL DEFAULT 0,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
-  
+  `);
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS password_resets (
       id BIGSERIAL PRIMARY KEY,
       email TEXT NOT NULL,
@@ -144,19 +78,9 @@ async function initDb() {
       used_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
-    CREATE INDEX IF NOT EXISTS password_resets_email_idx ON password_resets(email);
-    CREATE INDEX IF NOT EXISTS password_resets_token_hash_idx ON password_resets(token_hash);
-`);
-   await pool.query(`
-  CREATE TABLE IF NOT EXISTS password_resets (
-    id BIGSERIAL PRIMARY KEY,
-    email TEXT NOT NULL,
-    token_hash TEXT NOT NULL,
-    expires_at TIMESTAMPTZ NOT NULL,
-    used BOOLEAN NOT NULL DEFAULT false,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-  );
-`);
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS password_resets_email_idx ON password_resets(email);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS password_resets_token_hash_idx ON password_resets(token_hash);`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS payments (
@@ -201,36 +125,38 @@ function signToken(email) {
   return jwt.sign({ email }, JWT_SECRET, { expiresIn: "30d" });
 }
 
-async function sendPasswordResetEmail(toEmail, resetUrl) {
-  // If SMTP isn't configured, log the URL for development/testing.
-  const host = process.env.SMTP_HOST;
-  const port = Number(process.env.SMTP_PORT || "587");
-  const user = process.env.SMTP_USER;
-  const pass = process.env.SMTP_PASS;
-  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
-
-  if (!host || !from || !user || !pass) {
-    console.log("🔑 Password reset link (SMTP not configured):", resetUrl);
-    return;
-  }
-
-  const transporter = nodemailer.createTransport({
-    host,
-    port,
-    secure: port === 465,
-    auth: { user, pass }
-  });
-
-  await transporter.sendMail({
-    from,
-    to: toEmail,
-    subject: "Reset your LYPO password",
-    text: `Reset your password using this link (valid for 1 hour):\n\n${resetUrl}\n\nIf you didn't request this, you can ignore this email.`
-  });
-}
-
 function sha256Hex(s) {
   return crypto.createHash("sha256").update(String(s)).digest("hex");
+}
+function normalizeBaseUrl(u) {
+  const raw = String(u || "").trim();
+  if (!raw) return "";
+  if (/^https?:\/\//i.test(raw)) return raw.replace(/\/$/, "");
+  return `https://${raw}`.replace(/\/$/, "");
+}
+
+async function sendPasswordResetEmail(toEmail, resetUrl) {
+  if (!process.env.RESEND_API_KEY) {
+    console.log("🔑 Password reset link (RESEND_API_KEY missing):", resetUrl);
+    return;
+  }
+  try {
+    await resend.emails.send({
+      from: EMAIL_FROM,
+      to: toEmail,
+      subject: "Reset your LYPO password",
+      html: `
+        <p>We received a request to reset your password.</p>
+        <p><a href="${resetUrl}">Reset password</a></p>
+        <p>This link expires in 60 minutes.</p>
+        <p>If you didn’t request this, you can ignore this email.</p>
+      `
+    });
+    console.log("✅ Password reset email sent to:", toEmail);
+  } catch (err) {
+    console.error("❌ Resend send failed:", err?.message || err);
+    console.log("🔑 Password reset link (email failed):", resetUrl);
+  }
 }
 
 async function getUserByEmail(email) {
@@ -251,43 +177,15 @@ async function createUser(email, passwordHash) {
 }
 
 async function recordPayment({ email, stripeSessionId, amountUsd, lypos, status, invoiceUrl }) {
-  // Returns true if a NEW row was inserted. If the session already exists,
-  // the record is updated (status/invoice_url) and we return false.
   const e = normEmail(email);
-  const { rows } = await pool.query(
-    `WITH upsert AS (
-      INSERT INTO payments (email, stripe_session_id, amount_usd, lypos, status, invoice_url)
-      VALUES ($1,$2,$3,$4,$5,$6)
-      ON CONFLICT (stripe_session_id) DO UPDATE SET
-        status=EXCLUDED.status,
-        invoice_url=COALESCE(EXCLUDED.invoice_url, payments.invoice_url)
-      RETURNING (xmax = 0) AS inserted
-    )
-    SELECT inserted FROM upsert;`,
+  await pool.query(
+    `INSERT INTO payments (email, stripe_session_id, amount_usd, lypos, status, invoice_url)
+     VALUES ($1,$2,$3,$4,$5,$6)
+     ON CONFLICT (stripe_session_id) DO UPDATE SET
+       status=EXCLUDED.status,
+       invoice_url=COALESCE(EXCLUDED.invoice_url, payments.invoice_url)`,
     [e, stripeSessionId || null, Number(amountUsd||0), Math.trunc(lypos||0), status || "completed", invoiceUrl || null]
   );
-  return Boolean(rows?.[0]?.inserted);
-}
-
-async function resolveInvoiceOrReceiptUrlFromSession(session) {
-  try {
-    if (session?.invoice) {
-      const inv = await stripe.invoices.retrieve(String(session.invoice));
-      return inv.invoice_pdf || inv.hosted_invoice_url || null;
-    }
-
-    // For one-time payments, prefer the card receipt URL.
-    const piObj = session?.payment_intent;
-    const piId = (typeof piObj === "string") ? piObj : (piObj?.id || "");
-    if (!piId) return null;
-
-    // Retrieve again to be robust across Stripe API versions; expand charges.
-    const pi = await stripe.paymentIntents.retrieve(piId, { expand: ["charges", "latest_charge"] });
-    const charge = pi?.charges?.data?.[0] || (typeof pi?.latest_charge === "object" ? pi.latest_charge : null);
-    return charge?.receipt_url || null;
-  } catch {
-    return null;
-  }
 }
 
 async function upsertVideo({ email, predictionId, status, inputUrl, outputUrl }) {
@@ -377,12 +275,26 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
     const lypos = Number(session.metadata?.lypos || 0);
     const amountTotal = Number(session.amount_total || 0) / 100;
     const sessionId = session.id;
-    const invoiceUrl = await resolveInvoiceOrReceiptUrlFromSession(session);
+    let invoiceUrl = null;
+try {
+  // For one-time payments, Stripe may not create an "invoice". In that case we store the charge receipt URL.
+  if (session.invoice) {
+    const inv = await stripe.invoices.retrieve(String(session.invoice));
+    // Prefer a directly downloadable PDF when available.
+    invoiceUrl = inv.invoice_pdf || inv.hosted_invoice_url || null;
+  } else if (session.payment_intent) {
+    const pi = await stripe.paymentIntents.retrieve(String(session.payment_intent), { expand: ["charges"] });
+    const charge = pi?.charges?.data?.[0];
+    invoiceUrl = charge?.receipt_url || null;
+  }
+} catch (e) {
+  invoiceUrl = null;
+}
 
     if (email && lypos > 0) {
       try {
-        const inserted = await recordPayment({ email, stripeSessionId: sessionId, amountUsd: amountTotal, lypos, status: "completed", invoiceUrl });
-        if (inserted) await addBalance(email, lypos);
+        await recordPayment({ email, stripeSessionId: sessionId, amountUsd: amountTotal, lypos, status: "completed", invoiceUrl });
+        await addBalance(email, lypos);
         console.log("✅ Payment stored + credited LYPOS:", { email, lypos, amountTotal });
       } catch (e) {
         console.log("⚠️ Webhook credit failed:", e?.message || e);
@@ -431,59 +343,65 @@ app.get("/api/auth/me", auth, async (req, res) => {
   if (!u) return res.status(401).json({ error: "Invalid user" });
   res.json({ user: publicUserRow(u) });
 });
-app.post("/api/auth/forgot-password", async (req, res) => {
-  const { email } = req.body || {};
-  const e = email ? normEmail(email) : "";
-  // Always return ok to avoid email enumeration
+
+// ---- Forgot password (Resend HTTP email; no SMTP)
+// Always returns {ok:true} to avoid leaking whether an email exists.
+async function handleForgotPassword(req, res) {
+  const email = normEmail(req.body?.email || "");
   try {
-    if (e) {
-      const u = await getUserByEmail(e);
+    if (email) {
+      const u = await getUserByEmail(email);
       if (u) {
-        const token = crypto.randomBytes(24).toString("hex");
+        const token = crypto.randomBytes(32).toString("hex");
         const tokenHash = sha256Hex(token);
-        const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+        const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 60 minutes
 
         await pool.query(
           "INSERT INTO password_resets (email, token_hash, expires_at) VALUES ($1,$2,$3)",
-          [e, tokenHash, expiresAt]
+          [email, tokenHash, expiresAt]
         );
 
-        const appUrl = (process.env.APP_URL || process.env.FRONTEND_URL || "").replace(/\/$/, "");
-        const base = appUrl || "http://localhost:3000";
-        const resetUrl = `${base}/auth.html#reset=${encodeURIComponent(token)}&email=${encodeURIComponent(e)}`;
-        await sendPasswordResetEmail(e, resetUrl);
+        const base = normalizeBaseUrl(process.env.APP_URL || process.env.FRONTEND_URL || FRONTEND_URL);
+        const resetUrl = `${base}/auth.html#reset=${encodeURIComponent(token)}&email=${encodeURIComponent(email)}`;
+
+        await sendPasswordResetEmail(email, resetUrl);
       }
     }
   } catch (err) {
     console.error("forgot-password error:", err?.message || err);
   }
-  res.json({ ok: true });
-});
+  return res.json({ ok: true });
+}
 
-app.post("/api/auth/reset-password", async (req, res) => {
-  const { email, token, newPassword } = req.body || {};
-  if (!email || !token || !newPassword) return res.status(400).json({ error: "Missing email/token/password" });
-  if (String(newPassword).length < 6) return res.status(400).json({ error: "Password too short (min 6)" });
+async function handleResetPassword(req, res) {
+  const email = normEmail(req.body?.email || "");
+  const token = String(req.body?.token || "");
+  const newPassword = String(req.body?.newPassword || "");
 
-  const e = normEmail(email);
+  if (!email || !token || !newPassword) return res.status(400).json({ error: "Missing email/token/newPassword" });
+  if (newPassword.length < 6) return res.status(400).json({ error: "Password too short (min 6)" });
+
   const tokenHash = sha256Hex(token);
 
   const r = await pool.query(
-    "SELECT * FROM password_resets WHERE email=$1 AND token_hash=$2 AND used_at IS NULL ORDER BY created_at DESC LIMIT 1",
-    [e, tokenHash]
+    "SELECT id, expires_at, used_at FROM password_resets WHERE email=$1 AND token_hash=$2 ORDER BY created_at DESC LIMIT 1",
+    [email, tokenHash]
   );
   const row = r.rows?.[0];
-  if (!row) return res.status(400).json({ error: "Invalid or expired reset link" });
+  if (!row || row.used_at) return res.status(400).json({ error: "Invalid or expired reset link" });
+  if (Date.now() > new Date(row.expires_at).getTime()) return res.status(400).json({ error: "Invalid or expired reset link" });
 
-  const exp = new Date(row.expires_at);
-  if (Date.now() > exp.getTime()) return res.status(400).json({ error: "Invalid or expired reset link" });
-
-  const passwordHash = await bcrypt.hash(String(newPassword), 10);
-  await pool.query("UPDATE users SET password_hash=$1 WHERE email=$2", [passwordHash, e]);
+  const passwordHash = await bcrypt.hash(newPassword, 10);
+  await pool.query("UPDATE users SET password_hash=$1 WHERE email=$2", [passwordHash, email]);
   await pool.query("UPDATE password_resets SET used_at=now() WHERE id=$1", [row.id]);
 
-  res.json({ ok: true });
-});
+  return res.json({ ok: true });
+}
+
+app.post("/api/auth/forgot-password", handleForgotPassword);
+app.post("/api/auth/reset-password", handleResetPassword);
+app.post("/api/auth/forgot", handleForgotPassword);
+app.post("/api/auth/reset", handleResetPassword);
 
 
 // ---- Credits
@@ -551,27 +469,6 @@ app.get("/api/account/payments", auth, async (req, res) => {
     "SELECT stripe_session_id, amount_usd, lypos, status, invoice_url, created_at FROM payments WHERE email=$1 ORDER BY created_at DESC LIMIT 100",
     [email]
   );
-
-  // Best-effort backfill: if a payment exists without an invoice/receipt URL,
-  // try to resolve it from Stripe and persist it for future dashboard views.
-  // (No balance changes here.)
-  const missing = rows.filter(r => r.stripe_session_id && !r.invoice_url).slice(0, 5);
-  for (const r of missing) {
-    try {
-      const session = await stripe.checkout.sessions.retrieve(String(r.stripe_session_id), { expand: ["payment_intent", "payment_intent.charges"] });
-      const url = await resolveInvoiceOrReceiptUrlFromSession(session);
-      if (url) {
-        await pool.query(
-          "UPDATE payments SET invoice_url=$2 WHERE stripe_session_id=$1 AND invoice_url IS NULL",
-          [String(r.stripe_session_id), url]
-        );
-        r.invoice_url = url;
-      }
-    } catch {
-      // ignore
-    }
-  }
-
   res.json({ payments: rows });
 });
 
@@ -642,12 +539,24 @@ app.get("/api/stripe/confirm", auth, async (req, res) => {
 
   const amountTotal = Number(session.amount_total || 0) / 100;
 
-  // Resolve an invoice/receipt URL (stored and later shown in Dashboard)
-  const invoiceUrl = await resolveInvoiceOrReceiptUrlFromSession(session);
-
-  // Record payment + credit balance (truly idempotent: credit only on first insert)
+  // Try to resolve an invoice/receipt URL
+  let invoiceUrl = null;
   try {
-    const inserted = await recordPayment({
+    if (session.invoice) {
+      const inv = await stripe.invoices.retrieve(String(session.invoice));
+      invoiceUrl = inv.invoice_pdf || inv.hosted_invoice_url || null;
+    } else {
+      const pi = session.payment_intent;
+      const charge = pi?.charges?.data?.[0];
+      invoiceUrl = charge?.receipt_url || null;
+    }
+  } catch {
+    invoiceUrl = null;
+  }
+
+  // Record payment + credit balance (idempotent because stripe_session_id is UNIQUE)
+  try {
+    await recordPayment({
       email,
       stripeSessionId: session.id,
       amountUsd: amountTotal,
@@ -655,9 +564,13 @@ app.get("/api/stripe/confirm", auth, async (req, res) => {
       status: "completed",
       invoiceUrl
     });
-    if (inserted) await addBalance(email, credits);
+    await addBalance(email, credits);
   } catch (e) {
-    console.log("⚠️ confirm payment failed:", String(e?.message || e));
+    // If already recorded, ignore; still return current balance
+    const msg = String(e?.message || "");
+    if (!msg.toLowerCase().includes("duplicate") && !msg.toLowerCase().includes("unique")) {
+      console.log("⚠️ confirm payment failed:", msg);
+    }
   }
 
   const bal = await getBalance(email);
