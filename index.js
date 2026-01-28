@@ -38,8 +38,7 @@ app.use((req, res, next) => {
    Auth + Credits + Stripe (LYPOS)
 ---------------------------- */
 const LYPOS_PER_USD = 100;
-const PRICE_PER_30S_USD = Number(process.env.PRICE_PER_30S_USD || 2.89);
-const PRICE_PER_30S_LYPOS = Math.round(PRICE_PER_30S_USD * LYPOS_PER_USD);
+const CREDITS_PER_SECOND = Number(process.env.CREDITS_PER_SECOND || 10);
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "");
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
@@ -87,7 +86,6 @@ async function initDb() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
-}
 }
 
 function normEmail(email) {
@@ -278,8 +276,8 @@ app.get("/api/credits", auth, async (req, res) => {
 app.post("/api/credits/charge", auth, async (req, res) => {
   const email = req.user.email;
   const seconds = Number(req.body?.seconds || 0);
-  const units = Math.max(1, Math.ceil(seconds / 30));
-  const cost = units * PRICE_PER_30S_LYPOS;
+  const s = Math.max(1, Math.ceil(seconds));
+  const cost = s * CREDITS_PER_SECOND;
 
   const result = await chargeBalance(email, cost);
   if (!result.ok && result.code === "NO_USER") return res.status(401).json({ error: "Invalid user" });
@@ -469,9 +467,8 @@ app.post("/api/dub-upload", auth, (req, res) => {
         if (!outputLanguage) return res.status(400).json({ error: "Missing output_language" });
 
         // Charge credits server-side (authoritative)
-        const seconds = Math.max(1, Number(secondsField || 0));
-        const units = Math.max(1, Math.ceil(seconds / 30));
-        const cost = units * PRICE_PER_30S_LYPOS;
+        const seconds = Math.max(1, Math.ceil(Number(secondsField || 0)));
+        const cost = seconds * CREDITS_PER_SECOND;
 
         const email = req.user.email;
         const charge = await chargeBalance(email, cost);
