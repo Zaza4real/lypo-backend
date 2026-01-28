@@ -205,15 +205,24 @@ function auth(req, res, next) {
 
 // ---- Admin guard
 // Backend env: ADMIN_EMAILS="admin1@example.com,admin2@example.com"
-function requireAdmin(req, res, next) {
-  const allow = new Set(
+function adminAllowSet() {
+  return new Set(
     String(process.env.ADMIN_EMAILS || "")
       .split(",")
       .map((s) => s.trim().toLowerCase())
       .filter(Boolean)
   );
+}
+
+function isAdminEmail(email) {
+  const allow = adminAllowSet();
+  const e = normEmail(email);
+  return !!e && allow.size > 0 && allow.has(e);
+}
+
+function requireAdmin(req, res, next) {
   const email = normEmail(req.user?.email);
-  if (!email || allow.size === 0 || !allow.has(email)) {
+  if (!isAdminEmail(email)) {
     return res.status(403).json({ error: "NOT_AUTHORIZED" });
   }
   return next();
@@ -287,6 +296,13 @@ app.get("/api/auth/me", auth, async (req, res) => {
   const email = req.user?.email;
   const u = await getUserByEmail(email);
   if (!u) return res.status(401).json({ error: "Invalid user" });
+
+// ---- Admin: check if current user is admin
+app.get("/api/admin/status", auth, (req, res) => {
+  const email = normEmail(req.user?.email);
+  return res.json({ isAdmin: isAdminEmail(email), email });
+});
+
   res.json({ user: publicUserRow(u) });
 });
 
@@ -308,7 +324,7 @@ app.post("/api/admin/add-credits", auth, requireAdmin, async (req, res) => {
   const reason = String(req.body?.reason || "").slice(0, 300);
 
   if (!email) return res.status(400).json({ error: "Missing email" });
-  if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: "Invalid amount" });
+  if (!Number.isFinite(amount) || amount === 0) return res.status(400).json({ error: "Invalid amount" });
 
   const u = await getUserByEmail(email);
   if (!u) return res.status(404).json({ error: "NO_USER" });
