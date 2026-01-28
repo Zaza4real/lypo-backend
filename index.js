@@ -3,8 +3,44 @@ import Replicate from "replicate";
 import Busboy from "busboy";
 import crypto from "crypto";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import Stripe from "stripe";
 
 const app = express();
+
+/* ---------------------------
+   Credits (LYPOS) — demo store
+   1 USD = 100 LYPOS
+   NOTE: replace with DB in production.
+---------------------------- */
+const LYPOS_PER_USD = 100;
+const PRICE_PER_30S_LYPOS = 289;
+
+const creditsStore = new Map();
+function getBalance(userId){
+  if (!userId) return 0;
+  if (!creditsStore.has(userId)) creditsStore.set(userId, 0);
+  return creditsStore.get(userId) || 0;
+}
+function addCredits(userId, amount){
+  const bal = getBalance(userId);
+  const next = Math.max(0, bal + Number(amount || 0));
+  creditsStore.set(userId, next);
+  return next;
+}
+function chargeCredits(userId, amount){
+  const bal = getBalance(userId);
+  const a = Number(amount || 0);
+  if (bal < a){
+    const err = new Error('INSUFFICIENT_LYPOS');
+    err.statusCode = 402;
+    err.meta = { required: a, balance: bal };
+    throw err;
+  }
+  const next = bal - a;
+  creditsStore.set(userId, next);
+  return next;
+}
+
 
 /* ---------------------------
    CORS (demo-friendly)
@@ -16,6 +52,36 @@ app.use((req, res, next) => {
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
+
+
+/* ---------------------------
+   Stripe webhook (RAW body)
+---------------------------- */
+app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), (req, res) => {
+  const sig = req.headers["stripe-signature"];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET || "");
+  } catch (err) {
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === "checkout.session.completed") {
+    const session = event.data.object;
+    const userId = session.metadata?.userId;
+    const lypos = Number(session.metadata?.lypos || 0);
+    if (userId && lypos > 0) {
+      const next = addCredits(userId, lypos);
+      console.log("✅ LYPOS credited:", { userId, lypos, balance: next });
+    }
+  }
+
+  res.json({ received: true });
+});
+
+// JSON body parsing (safe for non-multipart routes)
+app.use(express.json({ limit: '1mb' }));
 
 /* ---------------------------
    ENV
@@ -30,6 +96,11 @@ const {
   S3_BUCKET,
   PUBLIC_BASE_URL
 } = process.env;
+
+/* ---------------------------
+   Stripe
+---------------------------- */
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", { apiVersion: "2024-06-20" });
 
 function requireEnv(name, value) {
   if (!value) {
@@ -97,6 +168,68 @@ app.get("/api/languages", (_req, res) => {
       "Chinese","Japanese","Korean","Vietnamese","Thai","Indonesian"
     ]
   });
+
+/* ---------------------------
+   Credits API (LYPOS)
+---------------------------- */
+app.get("/api/credits", (req, res) => {
+  const userId = req.query.userId;
+  res.json({ balance: getBalance(userId) });
+});
+
+app.post("/api/credits/charge", (req, res, next) => {
+  try {
+    const { userId, seconds } = req.body || {};
+    if (!userId) return res.status(400).json({ error: "Missing userId" });
+
+/* ---------------------------
+   Stripe: create checkout (buy LYPOS)
+   POST { userId, usd }
+---------------------------- */
+app.post("/api/stripe/create-checkout", async (req, res, next) => {
+  try {
+    const { userId, usd } = req.body || {};
+    if (!userId) return res.status(400).json({ error: "Missing userId" });
+
+    const dollars = Number(usd || 0);
+    if (!Number.isFinite(dollars) || dollars <= 0) return res.status(400).json({ error: "Invalid usd" });
+
+    const lypos = Math.round(dollars * LYPOS_PER_USD);
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      line_items: [
+        {
+          price_data: {
+            currency: "usd",
+            unit_amount: Math.round(dollars * 100),
+            product_data: { name: `${lypos} LYPOS` }
+          },
+          quantity: 1
+        }
+      ],
+      metadata: { userId: String(userId), lypos: String(lypos) },
+      success_url: `${process.env.FRONTEND_URL || "http://localhost:3000"}/?paid=1`,
+      cancel_url: `${process.env.FRONTEND_URL || "http://localhost:3000"}/?paid=0`
+    });
+
+    res.json({ url: session.url });
+  } catch (e) { next(e); }
+});
+
+
+    const s = Number(seconds || 0);
+    const units = Math.max(1, Math.ceil(s / 30));
+    const cost = units * PRICE_PER_30S_LYPOS;
+
+    const remaining = chargeCredits(userId, cost);
+    res.json({ charged: cost, remaining });
+  } catch (e) {
+    if (e?.statusCode === 402) return res.status(402).json({ error: "INSUFFICIENT_LYPOS", ...(e.meta || {}) });
+    next(e);
+  }
+});
+
 });
 
 /**
@@ -241,3 +374,12 @@ app.get("/api/dub/:id", async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`LYPO backend running on ${port}`));
+
+
+/* ---------------------------
+   Error handler
+---------------------------- */
+app.use((err, req, res, next) => {
+  console.error("❌ Error:", err?.message || err);
+  res.status(err.statusCode || 500).json({ error: err?.message || "Server error" });
+});
