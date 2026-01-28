@@ -1,12 +1,14 @@
 import express from "express";
-import Stripe from "stripe";
-import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
-import fs from "fs";
 import Replicate from "replicate";
 import Busboy from "busboy";
 import crypto from "crypto";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import Stripe from "stripe";
+import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 
 const app = express();
 
@@ -15,68 +17,54 @@ const app = express();
 ---------------------------- */
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Stripe-Signature");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
-
 /* ---------------------------
-   Auth + Credits + Stripe
+   Auth + Credits + Stripe (LYPOS)
+   - $1 = 100 LYPOS
+   - 30s = 289 LYPOS (based on $2.89)
+   NOTE: users.json is a simple starter store.
 ---------------------------- */
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "");
-const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
-const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
-const JWT_SECRET = process.env.JWT_SECRET || "dev_change_me";
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const USERS_PATH = path.join(__dirname, "users.json");
 
 const LYPOS_PER_USD = 100;
 const PRICE_PER_30S_USD = Number(process.env.PRICE_PER_30S_USD || 2.89);
 const PRICE_PER_30S_LYPOS = Math.round(PRICE_PER_30S_USD * LYPOS_PER_USD);
 
-const USERS_FILE = new URL("./users.json", import.meta.url).pathname;
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "");
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
+const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
+const JWT_SECRET = process.env.JWT_SECRET || "dev_change_me";
 
-function loadUsers() {
-  try {
-    if (!fs.existsSync(USERS_FILE)) return {};
-    const raw = fs.readFileSync(USERS_FILE, "utf-8");
-    const data = JSON.parse(raw || "{}");
-    return data.users || {};
-  } catch (e) {
-    console.error("Failed to load users.json:", e);
-    return {};
-  }
+function readDb(){
+  try { return JSON.parse(fs.readFileSync(USERS_PATH, "utf-8")); }
+  catch { return { users: [] }; }
 }
-function saveUsers(users) {
-  try {
-    fs.writeFileSync(USERS_FILE, JSON.stringify({ users }, null, 2));
-  } catch (e) {
-    console.error("Failed to save users.json:", e);
-  }
+function writeDb(db){
+  fs.writeFileSync(USERS_PATH, JSON.stringify(db, null, 2));
 }
-let USERS = loadUsers();
-
-function signToken(email) {
-  return jwt.sign({ email }, JWT_SECRET, { expiresIn: "30d" });
+function findUser(email){
+  const db = readDb();
+  const e = String(email||"").toLowerCase();
+  const u = db.users.find(x => x.email === e);
+  return { db, u, e };
 }
-function getAuthEmail(req) {
+function publicUser(u){ return { email: u.email, balance: Number(u.balance||0), createdAt: u.createdAt }; }
+function signToken(email){ return jwt.sign({ email }, JWT_SECRET, { expiresIn: "30d" }); }
+function auth(req, res, next){
   const h = req.headers.authorization || "";
   const token = h.startsWith("Bearer ") ? h.slice(7) : "";
-  if (!token) return null;
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    return decoded?.email || null;
-  } catch {
-    return null;
-  }
-}
-function requireAuth(req, res, next) {
-  const email = getAuthEmail(req);
-  if (!email || !USERS[email]) return res.status(401).json({ error: "NOT_AUTHENTICATED" });
-  req.userEmail = email;
-  next();
+  if (!token) return res.status(401).json({ error: "NOT_AUTHENTICATED" });
+  try { req.user = jwt.verify(token, JWT_SECRET); return next(); }
+  catch { return res.status(401).json({ error: "INVALID_TOKEN" }); }
 }
 
-// Stripe webhook needs RAW body and must be registered before express.json()
+// Stripe webhook must use RAW body — define BEFORE express.json
 app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), (req, res) => {
   const sig = req.headers["stripe-signature"];
   let event;
@@ -91,106 +79,112 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), (req,
     const email = session.metadata?.email;
     const lypos = Number(session.metadata?.lypos || 0);
 
-    if (email && USERS[email] && lypos > 0) {
-      USERS[email].balance = Number(USERS[email].balance || 0) + lypos;
-      saveUsers(USERS);
-      console.log("✅ Credited LYPOS:", { email, lypos, balance: USERS[email].balance });
+    if (email && lypos > 0) {
+      const { db, u } = findUser(email);
+      if (u) {
+        u.balance = Number(u.balance||0) + lypos;
+        writeDb(db);
+        console.log("✅ Credited LYPOS:", { email, lypos, balance: u.balance });
+      } else {
+        console.log("⚠️ Webhook: user not found:", email);
+      }
     }
   }
 
   res.json({ received: true });
 });
 
-// JSON routes (everything except webhook)
+// JSON for normal routes
 app.use(express.json({ limit: "2mb" }));
 
-/* Auth routes */
+// ---- Auth
 app.post("/api/auth/signup", async (req, res) => {
-  const email = String(req.body?.email || "").trim().toLowerCase();
-  const password = String(req.body?.password || "");
+  const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: "Missing email/password" });
-  if (password.length < 6) return res.status(400).json({ error: "Password too short (min 6)" });
-  if (USERS[email]) return res.status(409).json({ error: "Email already registered" });
+  if (String(password).length < 6) return res.status(400).json({ error: "Password too short (min 6)" });
 
-  const passwordHash = await bcrypt.hash(password, 10);
-  USERS[email] = { passwordHash, balance: 0 };
-  saveUsers(USERS);
+  const { db, u, e } = findUser(email);
+  if (u) return res.status(409).json({ error: "Email already registered" });
 
-  res.json({ token: signToken(email), user: { email, balance: 0 } });
+  const passwordHash = await bcrypt.hash(String(password), 10);
+  const user = { email: e, passwordHash, balance: 0, createdAt: new Date().toISOString() };
+  db.users.push(user);
+  writeDb(db);
+
+  res.json({ token: signToken(e), user: publicUser(user) });
 });
 
 app.post("/api/auth/login", async (req, res) => {
-  const email = String(req.body?.email || "").trim().toLowerCase();
-  const password = String(req.body?.password || "");
-  const u = USERS[email];
+  const { email, password } = req.body || {};
+  if (!email || !password) return res.status(400).json({ error: "Missing email/password" });
+
+  const { u, e } = findUser(email);
   if (!u) return res.status(401).json({ error: "Invalid credentials" });
 
-  const ok = await bcrypt.compare(password, String(u.passwordHash || ""));
+  const ok = await bcrypt.compare(String(password), String(u.passwordHash||""));
   if (!ok) return res.status(401).json({ error: "Invalid credentials" });
 
-  res.json({ token: signToken(email), user: { email, balance: Number(u.balance || 0) } });
+  res.json({ token: signToken(e), user: publicUser(u) });
 });
 
-app.get("/api/auth/me", (req, res) => {
-  const email = getAuthEmail(req);
-  if (!email || !USERS[email]) return res.status(401).json({ error: "NOT_AUTHENTICATED" });
-  const u = USERS[email];
-  res.json({ user: { email, balance: Number(u.balance || 0) } });
+app.get("/api/auth/me", auth, (req, res) => {
+  const email = req.user?.email;
+  const { u } = findUser(email);
+  if (!u) return res.status(401).json({ error: "Invalid user" });
+  res.json({ user: publicUser(u) });
 });
 
-/* Credits */
-app.get("/api/credits", requireAuth, (req, res) => {
-  const u = USERS[req.userEmail];
-  res.json({ balance: Number(u.balance || 0) });
+// ---- Credits
+app.get("/api/credits", auth, (req, res) => {
+  const email = req.user.email;
+  const { u } = findUser(email);
+  if (!u) return res.status(401).json({ error: "Invalid user" });
+  res.json({ balance: Number(u.balance||0) });
 });
 
-app.post("/api/credits/charge", requireAuth, (req, res) => {
+app.post("/api/credits/charge", auth, (req, res) => {
+  const email = req.user.email;
   const seconds = Number(req.body?.seconds || 0);
-  const units = Math.max(1, Math.ceil((Number.isFinite(seconds) ? seconds : 0) / 30));
+  const units = Math.max(1, Math.ceil(seconds / 30));
   const cost = units * PRICE_PER_30S_LYPOS;
 
-  const u = USERS[req.userEmail];
-  const bal = Number(u.balance || 0);
-  if (bal < cost) {
-    return res.status(402).json({ error: "INSUFFICIENT_LYPOS", required: cost, balance: bal });
-  }
+  const { db, u } = findUser(email);
+  if (!u) return res.status(401).json({ error: "Invalid user" });
+
+  const bal = Number(u.balance||0);
+  if (bal < cost) return res.status(402).json({ error: "INSUFFICIENT_LYPOS", required: cost, balance: bal });
 
   u.balance = bal - cost;
-  saveUsers(USERS);
+  writeDb(db);
   res.json({ charged: cost, remaining: u.balance });
 });
 
-/* Stripe checkout: buy LYPOS */
-app.post("/api/stripe/create-checkout-session", requireAuth, async (req, res) => {
-  if (!process.env.STRIPE_SECRET_KEY) return res.status(500).json({ error: "Stripe not configured" });
-
+// ---- Stripe checkout: buy LYPOS
+app.post("/api/stripe/create-checkout-session", auth, async (req, res) => {
   const usd = Number(req.body?.usd || 0);
   if (!Number.isFinite(usd) || usd <= 0) return res.status(400).json({ error: "Invalid usd" });
 
+  const email = req.user.email;
   const lypos = Math.round(usd * LYPOS_PER_USD);
 
   const session = await stripe.checkout.sessions.create({
     mode: "payment",
-    customer_email: req.userEmail,
-    line_items: [
-      {
-        price_data: {
-          currency: "usd",
-          unit_amount: Math.round(usd * 100),
-          product_data: { name: `${lypos} LYPOS` }
-        },
-        quantity: 1
-      }
-    ],
-    metadata: { email: req.userEmail, lypos: String(lypos) },
+    customer_email: email,
+    line_items: [{
+      price_data: {
+        currency: "usd",
+        unit_amount: Math.round(usd * 100),
+        product_data: { name: `${lypos} LYPOS` }
+      },
+      quantity: 1
+    }],
+    metadata: { email, lypos: String(lypos) },
     success_url: `${FRONTEND_URL}/?paid=1`,
     cancel_url: `${FRONTEND_URL}/?paid=0`
   });
 
-  res.json({ url: session.url, lypos });
+  res.json({ url: session.url });
 });
-
-
 
 
 /* ---------------------------
@@ -264,52 +258,13 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/api/languages", (_req, res) => {
   res.json({
     languages: [
-      "Arabic",
-      "Arabic (Egypt)",
-      "Arabic (Saudi Arabia)",
-      "Bulgarian",
-      "Chinese",
-      "Chinese (Mandarin, Simplified)",
-      "Chinese (Taiwanese Mandarin, Traditional)",
-      "Croatian",
-      "Czech",
-      "Danish (Denmark)",
-      "Dutch (Netherlands)",
-      "English",
-      "English (Australia)",
-      "English (Canada)",
-      "English (India)",
-      "English (UK)",
-      "English (United States)",
-      "Filipino (Philippines)",
-      "Finnish (Finland)",
-      "French (Canada)",
-      "French (France)",
-      "German (Austria)",
-      "German (Germany)",
-      "German (Switzerland)",
-      "Greek (Greece)",
-      "Hindi (India)",
-      "Indonesian (Indonesia)",
-      "Italian (Italy)",
-      "Japanese (Japan)",
-      "Korean (Korea)",
-      "Malay (Malaysia)",
-      "Mandarin",
-      "Polish (Poland)",
-      "Portuguese (Brazil)",
-      "Portuguese (Portugal)",
-      "Romanian (Romania)",
-      "Russian (Russia)",
-      "Slovak (Slovakia)",
-      "Spanish (Mexico)",
-      "Spanish (Spain)",
-      "Swedish (Sweden)",
-      "Tamil (India)",
-      "Turkish (T\u00fcrkiye)",
-      "Ukrainian (Ukraine)",
-      "Vietnamese (Vietnam)",
-      "Thai (Thailand)"
+      "English","Spanish","French","German","Italian","Portuguese",
+      "Dutch","Swedish","Norwegian","Danish","Finnish",
+      "Polish","Czech","Slovak","Hungarian","Romanian",
+      "Greek","Turkish","Ukrainian","Russian",
+      "Arabic","Hebrew",
+      "Hindi","Bengali","Urdu",
+      "Chinese","Japanese","Korean","Vietnamese","Thai","Indonesian"
     ]
   });
 });
