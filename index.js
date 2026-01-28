@@ -426,3 +426,4 @@ app.get("/api/dub/:id", auth, async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`LYPO backend running on ${port}`));
+
