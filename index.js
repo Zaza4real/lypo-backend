@@ -3,18 +3,263 @@ import Replicate from "replicate";
 import Busboy from "busboy";
 import crypto from "crypto";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import Stripe from "stripe";
+import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
+import pg from "pg";
 
 const app = express();
 
 /* ---------------------------
-   CORS (demo-friendly)
+   CORS
 ---------------------------- */
+const allowedOrigins = new Set([
+  "https://digitalgeekworld.com",
+  "https://www.digitalgeekworld.com",
+  "https://homepage-3d78.onrender.com",
+  process.env.FRONTEND_URL || ""
+].filter(Boolean));
+
+const CORS_ALLOW_ALL = process.env.CORS_ALLOW_ALL === "1";
+
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  const origin = req.headers.origin;
+  if (origin && (CORS_ALLOW_ALL || allowedOrigins.has(origin))) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  }
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
+});
+
+/* ---------------------------
+   Auth + Credits + Stripe (LYPOS)
+---------------------------- */
+const LYPOS_PER_USD = 100;
+const PRICE_PER_30S_USD = Number(process.env.PRICE_PER_30S_USD || 2.89);
+const PRICE_PER_30S_LYPOS = Math.round(PRICE_PER_30S_USD * LYPOS_PER_USD);
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "");
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
+const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
+const JWT_SECRET = process.env.JWT_SECRET || "dev_change_me";
+
+// ---- Postgres
+const { Pool } = pg;
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  // Render Postgres usually requires SSL in production
+  ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false
+});
+
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      email TEXT PRIMARY KEY,
+      password_hash TEXT NOT NULL,
+      balance INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+}
+
+function normEmail(email) {
+  return String(email || "").toLowerCase().trim();
+}
+function publicUserRow(r) {
+  return { email: r.email, balance: Number(r.balance || 0), createdAt: r.created_at };
+}
+function signToken(email) {
+  return jwt.sign({ email }, JWT_SECRET, { expiresIn: "30d" });
+}
+
+async function getUserByEmail(email) {
+  const e = normEmail(email);
+  const { rows } = await pool.query(
+    "SELECT email, password_hash, balance, created_at FROM users WHERE email=$1",
+    [e]
+  );
+  return rows[0] || null;
+}
+async function createUser(email, passwordHash) {
+  const e = normEmail(email);
+  const { rows } = await pool.query(
+    "INSERT INTO users (email, password_hash, balance) VALUES ($1,$2,0) RETURNING email, password_hash, balance, created_at",
+    [e, passwordHash]
+  );
+  return rows[0];
+}
+async function addBalance(email, lypos) {
+  const e = normEmail(email);
+  await pool.query("UPDATE users SET balance = balance + $2 WHERE email=$1", [
+    e,
+    Math.max(0, Math.trunc(lypos))
+  ]);
+}
+async function chargeBalance(email, cost) {
+  const e = normEmail(email);
+  const c = Math.max(0, Math.trunc(cost));
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      "SELECT balance FROM users WHERE email=$1 FOR UPDATE",
+      [e]
+    );
+    if (!rows[0]) {
+      await client.query("ROLLBACK");
+      return { ok: false, code: "NO_USER" };
+    }
+    const bal = Number(rows[0].balance || 0);
+    if (bal < c) {
+      await client.query("ROLLBACK");
+      return { ok: false, code: "INSUFFICIENT", balance: bal };
+    }
+    const newBal = bal - c;
+    await client.query("UPDATE users SET balance=$2 WHERE email=$1", [e, newBal]);
+    await client.query("COMMIT");
+    return { ok: true, balance: newBal };
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+function auth(req, res, next) {
+  const h = req.headers.authorization || "";
+  const token = h.startsWith("Bearer ") ? h.slice(7) : "";
+  if (!token) return res.status(401).json({ error: "NOT_AUTHENTICATED" });
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    return next();
+  } catch {
+    return res.status(401).json({ error: "INVALID_TOKEN" });
+  }
+}
+
+// Stripe webhook must use RAW body — define BEFORE express.json
+app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  const sig = req.headers["stripe-signature"];
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === "checkout.session.completed") {
+    const session = event.data.object;
+    const email = session.metadata?.email;
+    const lypos = Number(session.metadata?.lypos || 0);
+
+    if (email && lypos > 0) {
+      try {
+        await addBalance(email, lypos);
+        console.log("✅ Credited LYPOS:", { email, lypos });
+      } catch (e) {
+        console.log("⚠️ Webhook credit failed:", e?.message || e);
+      }
+    }
+  }
+
+  res.json({ received: true });
+});
+
+// JSON for normal routes
+app.use(express.json({ limit: "2mb" }));
+
+// ---- Auth routes
+app.post("/api/auth/signup", async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) return res.status(400).json({ error: "Missing email/password" });
+  if (String(password).length < 6) return res.status(400).json({ error: "Password too short (min 6)" });
+
+  const e = normEmail(email);
+  const existing = await getUserByEmail(e);
+  if (existing) return res.status(409).json({ error: "Email already registered" });
+
+  const passwordHash = await bcrypt.hash(String(password), 10);
+  const row = await createUser(e, passwordHash);
+  res.json({ token: signToken(e), user: publicUserRow(row) });
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) return res.status(400).json({ error: "Missing email/password" });
+
+  const e = normEmail(email);
+  const u = await getUserByEmail(e);
+  if (!u) return res.status(401).json({ error: "Invalid credentials" });
+
+  const ok = await bcrypt.compare(String(password), String(u.password_hash || ""));
+  if (!ok) return res.status(401).json({ error: "Invalid credentials" });
+
+  res.json({ token: signToken(e), user: publicUserRow(u) });
+});
+
+app.get("/api/auth/me", auth, async (req, res) => {
+  const email = req.user?.email;
+  const u = await getUserByEmail(email);
+  if (!u) return res.status(401).json({ error: "Invalid user" });
+  res.json({ user: publicUserRow(u) });
+});
+
+// ---- Credits
+app.get("/api/credits", auth, async (req, res) => {
+  const email = req.user.email;
+  const u = await getUserByEmail(email);
+  if (!u) return res.status(401).json({ error: "Invalid user" });
+  res.json({ balance: Number(u.balance || 0) });
+});
+
+app.post("/api/credits/charge", auth, async (req, res) => {
+  const email = req.user.email;
+  const seconds = Number(req.body?.seconds || 0);
+  const units = Math.max(1, Math.ceil(seconds / 30));
+  const cost = units * PRICE_PER_30S_LYPOS;
+
+  const result = await chargeBalance(email, cost);
+  if (!result.ok && result.code === "NO_USER") return res.status(401).json({ error: "Invalid user" });
+  if (!result.ok && result.code === "INSUFFICIENT") {
+    return res.status(402).json({ error: "INSUFFICIENT_LYPOS", required: cost, balance: result.balance });
+  }
+  res.json({ charged: cost, remaining: result.balance });
+});
+
+// ---- Stripe checkout: buy LYPOS
+app.post("/api/stripe/create-checkout-session", auth, async (req, res) => {
+  const usd = Number(req.body?.usd || 0);
+  if (!Number.isFinite(usd) || usd <= 0) return res.status(400).json({ error: "Invalid usd" });
+
+  const email = req.user.email;
+  const lypos = Math.round(usd * LYPOS_PER_USD);
+
+  const session = await stripe.checkout.sessions.create({
+    mode: "payment",
+    customer_email: email,
+    line_items: [
+      {
+        price_data: {
+          currency: "usd",
+          unit_amount: Math.round(usd * 100),
+          product_data: { name: `${lypos} LYPOS` }
+        },
+        quantity: 1
+      }
+    ],
+    metadata: { email, lypos: String(lypos) },
+    success_url: `${FRONTEND_URL}/?paid=1`,
+    cancel_url: `${FRONTEND_URL}/?paid=0`
+  });
+
+  res.json({ url: session.url });
 });
 
 /* ---------------------------
@@ -61,13 +306,11 @@ const s3 = new S3Client({
 
 /* ---------------------------
    Helper: create prediction
-   IMPORTANT: uses version (never model)
 ---------------------------- */
 async function createHeygenPrediction({ videoUrl, outputLanguage }) {
   const version = requireEnv("REPLICATE_MODEL_VERSION", REPLICATE_MODEL_VERSION);
   requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
 
-  // Useful debug logs (safe—no secrets)
   console.log("Creating Replicate prediction with version:", version);
   console.log("Input:", { video: videoUrl, output_language: outputLanguage });
 
@@ -103,14 +346,11 @@ app.get("/api/languages", (_req, res) => {
  * POST /api/dub-upload
  * multipart/form-data:
  *  - video: (file)
- *  - output_language: (string e.g. "Spanish")
- *
- * Uploads the file to S3/R2, then starts a Replicate prediction.
- * Returns id = Replicate prediction id (so polling never loses state).
+ *  - output_language: (string)
+ *  - seconds: (number, optional)
  */
-app.post("/api/dub-upload", (req, res) => {
+app.post("/api/dub-upload", auth, (req, res) => {
   try {
-    // Validate required env vars early for a clean error message
     requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
     requireEnv("REPLICATE_MODEL_VERSION", REPLICATE_MODEL_VERSION);
     requireEnv("S3_ENDPOINT", S3_ENDPOINT);
@@ -125,11 +365,13 @@ app.post("/api/dub-upload", (req, res) => {
     });
 
     let outputLanguage = null;
+    let secondsField = 0;
     let fileInfo = null;
     let chunks = [];
 
     bb.on("field", (name, val) => {
       if (name === "output_language") outputLanguage = val;
+      if (name === "seconds") secondsField = Number(val || 0);
     });
 
     bb.on("file", (name, file, info) => {
@@ -137,23 +379,29 @@ app.post("/api/dub-upload", (req, res) => {
         file.resume();
         return;
       }
-
       fileInfo = info;
       chunks = [];
-
       file.on("data", (d) => chunks.push(d));
-      file.on("limit", () => {
-        chunks = [];
-      });
-      file.on("error", (e) => {
-        console.error("Upload stream error:", e);
-      });
+      file.on("limit", () => { chunks = []; });
+      file.on("error", (e) => { console.error("Upload stream error:", e); });
     });
 
     bb.on("finish", async () => {
       try {
         if (!fileInfo) return res.status(400).json({ error: "Missing video file (field name: video)" });
         if (!outputLanguage) return res.status(400).json({ error: "Missing output_language" });
+
+        // Charge credits server-side (authoritative)
+        const seconds = Math.max(1, Number(secondsField || 0));
+        const units = Math.max(1, Math.ceil(seconds / 30));
+        const cost = units * PRICE_PER_30S_LYPOS;
+
+        const email = req.user.email;
+        const charge = await chargeBalance(email, cost);
+        if (!charge.ok && charge.code === "NO_USER") return res.status(401).json({ error: "Invalid user" });
+        if (!charge.ok && charge.code === "INSUFFICIENT") {
+          return res.status(402).json({ error: "INSUFFICIENT_LYPOS", required: cost, balance: charge.balance });
+        }
 
         const body = Buffer.concat(chunks);
         if (!body.length) return res.status(400).json({ error: "Empty upload or file too large" });
@@ -172,13 +420,8 @@ app.post("/api/dub-upload", (req, res) => {
         const base = PUBLIC_BASE_URL.replace(/\/$/, "");
         const videoUrl = `${base}/${key}`;
 
-        const prediction = await createHeygenPrediction({
-          videoUrl,
-          outputLanguage
-        });
+        const prediction = await createHeygenPrediction({ videoUrl, outputLanguage });
 
-        // ✅ Return Replicate prediction id as the job id.
-        // This avoids “job not found” even if Render restarts.
         res.json({
           id: prediction.id,
           predictionId: prediction.id,
@@ -200,9 +443,8 @@ app.post("/api/dub-upload", (req, res) => {
 
 /**
  * GET /api/dub/:id
- * Polls Replicate prediction by id (no in-memory state needed).
  */
-app.get("/api/dub/:id", async (req, res) => {
+app.get("/api/dub/:id", auth, async (req, res) => {
   try {
     requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
 
@@ -212,7 +454,6 @@ app.get("/api/dub/:id", async (req, res) => {
     let outputUrl = null;
     const out = prediction.output;
 
-    // Replicate output may be file-like (url()), string, array, etc.
     if (out && typeof out === "object" && typeof out.url === "function") {
       outputUrl = out.url();
     } else if (typeof out === "string") {
@@ -240,5 +481,14 @@ app.get("/api/dub/:id", async (req, res) => {
   }
 });
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`LYPO backend running on ${port}`));
+const PORT = process.env.PORT || 3000;
+
+initDb()
+  .then(() => {
+    console.log("✅ DB ready");
+    app.listen(PORT, () => console.log(`LYPO backend running on ${PORT}`));
+  })
+  .catch((e) => {
+    console.error("❌ DB init failed", e);
+    process.exit(1);
+  });
