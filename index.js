@@ -386,17 +386,83 @@ app.post("/api/stripe/create-checkout-session", auth, async (req, res) => {
         price_data: {
           currency: "usd",
           unit_amount: Math.round(usd * 100),
-          product_data: { name: `${lypos} LYPOS` }
+          product_data: { name: `${lypos} Credits` }
         },
         quantity: 1
       }
     ],
     metadata: { email, lypos: String(lypos) },
-    success_url: `${FRONTEND_URL}/dashboard.html?paid=1`,
+    success_url: `${FRONTEND_URL}/dashboard.html?paid=1&session_id={CHECKOUT_SESSION_ID}`,
     cancel_url: `${FRONTEND_URL}/dashboard.html?paid=0`
   });
 
   res.json({ url: session.url });
+});
+
+// Confirm Checkout Session on return (fallback if webhook is not configured)
+// Idempotent: will not double-credit if already recorded.
+app.get("/api/stripe/confirm", auth, async (req, res) => {
+  const sessionId = String(req.query?.session_id || "").trim();
+  if (!sessionId) return res.status(400).json({ error: "Missing session_id" });
+
+  // Retrieve the session from Stripe
+  const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ["payment_intent", "payment_intent.charges"] });
+
+  // Must belong to the logged-in user
+  const email = req.user.email;
+  const sessionEmail = session.customer_email || session.metadata?.email;
+  if (!sessionEmail || String(sessionEmail).toLowerCase() !== String(email).toLowerCase()) {
+    return res.status(403).json({ error: "NOT_AUTHORIZED" });
+  }
+
+  // Ensure it actually paid
+  if (session.payment_status !== "paid") {
+    return res.status(400).json({ error: "Payment not completed" });
+  }
+
+  const credits = Number(session.metadata?.lypos || session.metadata?.credits || 0);
+  if (!Number.isFinite(credits) || credits <= 0) {
+    return res.status(400).json({ error: "Missing credits metadata" });
+  }
+
+  const amountTotal = Number(session.amount_total || 0) / 100;
+
+  // Try to resolve an invoice/receipt URL
+  let invoiceUrl = null;
+  try {
+    if (session.invoice) {
+      const inv = await stripe.invoices.retrieve(String(session.invoice));
+      invoiceUrl = inv.invoice_pdf || inv.hosted_invoice_url || null;
+    } else {
+      const pi = session.payment_intent;
+      const charge = pi?.charges?.data?.[0];
+      invoiceUrl = charge?.receipt_url || null;
+    }
+  } catch {
+    invoiceUrl = null;
+  }
+
+  // Record payment + credit balance (idempotent because stripe_session_id is UNIQUE)
+  try {
+    await recordPayment({
+      email,
+      stripeSessionId: session.id,
+      amountUsd: amountTotal,
+      lypos: credits,
+      status: "completed",
+      invoiceUrl
+    });
+    await addBalance(email, credits);
+  } catch (e) {
+    // If already recorded, ignore; still return current balance
+    const msg = String(e?.message || "");
+    if (!msg.toLowerCase().includes("duplicate") && !msg.toLowerCase().includes("unique")) {
+      console.log("⚠️ confirm payment failed:", msg);
+    }
+  }
+
+  const bal = await getBalance(email);
+  res.json({ ok: true, balance: bal, invoice_url: invoiceUrl });
 });
 
 /* ---------------------------
