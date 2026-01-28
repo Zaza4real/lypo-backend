@@ -18,12 +18,15 @@ const app = express();
 const allowedOrigins = new Set([
   "https://digitalgeekworld.com",
   "https://www.digitalgeekworld.com",
-  "https://homepage-3d78.onrender.com"
-]);
+  "https://homepage-3d78.onrender.com",
+  process.env.FRONTEND_URL || ""
+].filter(Boolean));
+
+const CORS_ALLOW_ALL = process.env.CORS_ALLOW_ALL === "1";
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (origin && allowedOrigins.has(origin)) {
+  if (origin && (CORS_ALLOW_ALL || allowedOrigins.has(origin))) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
   res.setHeader("Vary", "Origin");
@@ -288,7 +291,7 @@ app.get("/api/languages", (_req, res) => {
  * Uploads the file to S3/R2, then starts a Replicate prediction.
  * Returns id = Replicate prediction id (so polling never loses state).
  */
-app.post("/api/dub-upload", (req, res) => {
+app.post("/api/dub-upload", auth, (req, res) => {
   try {
     // Validate required env vars early for a clean error message
     requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
@@ -305,11 +308,13 @@ app.post("/api/dub-upload", (req, res) => {
     });
 
     let outputLanguage = null;
+    let secondsField = 0;
     let fileInfo = null;
     let chunks = [];
 
     bb.on("field", (name, val) => {
       if (name === "output_language") outputLanguage = val;
+      if (name === "seconds") secondsField = Number(val || 0);
     });
 
     bb.on("file", (name, file, info) => {
@@ -382,7 +387,7 @@ app.post("/api/dub-upload", (req, res) => {
  * GET /api/dub/:id
  * Polls Replicate prediction by id (no in-memory state needed).
  */
-app.get("/api/dub/:id", async (req, res) => {
+app.get("/api/dub/:id", auth, async (req, res) => {
   try {
     requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
 
