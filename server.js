@@ -69,7 +69,6 @@ app.post("/api/stripe/create-checkout-session", async (req, res) => {
     success_url: `${process.env.FRONTEND_URL}/?paid=1`,
     cancel_url: `${process.env.FRONTEND_URL}/?paid=0`,
   });
-
   res.json({ url: session.url });
 });
 
