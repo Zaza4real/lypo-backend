@@ -38,6 +38,7 @@ app.use((req, res, next) => {
    Auth + Credits + Stripe (LYPOS)
 ---------------------------- */
 const LYPOS_PER_USD = 100;
+const CREDITS_PER_SECOND = Number(process.env.CREDITS_PER_SECOND || 10);
 const PRICE_PER_30S_USD = Number(process.env.PRICE_PER_30S_USD || 2.89);
 const PRICE_PER_30S_LYPOS = Math.round(PRICE_PER_30S_USD * LYPOS_PER_USD);
 
@@ -83,11 +84,17 @@ async function initDb() {
       status TEXT NOT NULL DEFAULT 'starting',
       input_url TEXT,
       output_url TEXT,
+      cost_credits INTEGER NOT NULL DEFAULT 0,
+      refunded BOOLEAN NOT NULL DEFAULT false,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
-}
+
+  // Migrations for existing databases
+  await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS cost_credits INTEGER NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS refunded BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS invoice_url TEXT;`);
 }
 
 function normEmail(email) {
@@ -278,8 +285,8 @@ app.get("/api/credits", auth, async (req, res) => {
 app.post("/api/credits/charge", auth, async (req, res) => {
   const email = req.user.email;
   const seconds = Number(req.body?.seconds || 0);
-  const units = Math.max(1, Math.ceil(seconds / 30));
-  const cost = units * PRICE_PER_30S_LYPOS;
+  const s = Math.max(1, Math.ceil(seconds));
+  const cost = s * CREDITS_PER_SECOND;
 
   const result = await chargeBalance(email, cost);
   if (!result.ok && result.code === "NO_USER") return res.status(401).json({ error: "Invalid user" });
