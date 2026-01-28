@@ -24,9 +24,10 @@ const CORS_ALLOW_ALL = process.env.CORS_ALLOW_ALL === "1";
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (origin && (CORS_ALLOW_ALL || allowedOrigins.has(origin))) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-  }
+  // To avoid browser 'Failed to fetch' due to CORS, we reflect the Origin for all browser requests.
+  // (No cookies are used; auth is via Bearer token.)
+  if (origin) res.setHeader("Access-Control-Allow-Origin", origin);
+  else res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -136,6 +137,64 @@ async function recordPayment({ email, stripeSessionId, amountUsd, lypos, status,
   );
 }
 
+
+async function resolveInvoiceOrReceiptUrlFromSession(session) {
+  try {
+    if (session?.invoice) {
+      const inv = await stripe.invoices.retrieve(String(session.invoice));
+      return inv.invoice_pdf || inv.hosted_invoice_url || null;
+    }
+  } catch (e) {
+    console.log("⚠️ invoice retrieve failed:", e?.message || e);
+  }
+  try {
+    const piId = session?.payment_intent;
+    if (piId) {
+      const pi = await stripe.paymentIntents.retrieve(String(piId), { expand: ["charges.data"] });
+      const charge = pi?.charges?.data?.[0];
+      return charge?.receipt_url || null;
+    }
+  } catch (e) {
+    console.log("⚠️ payment_intent retrieve failed:", e?.message || e);
+  }
+  return null;
+}
+
+async function creditIfFirstTime({ email, stripeSessionId, amountUsd, lypos, status, invoiceUrl }) {
+  const e = normEmail(email);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const ins = await client.query(
+      `INSERT INTO payments (email, stripe_session_id, amount_usd, lypos, status, invoice_url)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (stripe_session_id) DO NOTHING
+       RETURNING stripe_session_id`,
+      [e, stripeSessionId || null, Number(amountUsd||0), Math.trunc(lypos||0), status || "completed", invoiceUrl || null]
+    );
+
+    if (ins.rowCount === 1) {
+      await client.query("UPDATE users SET balance = balance + $2 WHERE email=$1", [e, Math.max(0, Math.trunc(lypos))]);
+    } else {
+      // Update invoice_url/status if missing
+      await client.query(
+        `UPDATE payments
+         SET status = COALESCE($3, status),
+             invoice_url = COALESCE(NULLIF($4,''), invoice_url)
+         WHERE stripe_session_id = $2`,
+        [e, stripeSessionId || null, status || null, invoiceUrl || ""]
+      );
+    }
+
+    await client.query("COMMIT");
+    return { credited: ins.rowCount === 1 };
+  } catch (err) {
+    try { await client.query("ROLLBACK"); } catch {}
+    throw err;
+  } finally {
+    client.release();
+  }
+}
 async function upsertVideo({ email, predictionId, status, inputUrl, outputUrl }) {
   const e = normEmail(email);
   await pool.query(
@@ -150,33 +209,13 @@ async function upsertVideo({ email, predictionId, status, inputUrl, outputUrl })
   );
 }
 
-async function updatePaymentInvoice(email, stripeSessionId, invoiceUrl) {
-  if (!invoiceUrl) return;
-  try {
-    await pool.query(
-      `UPDATE payments
-         SET invoice_url = $1
-       WHERE email = $2
-         AND stripe_session_id = $3
-         AND (invoice_url IS NULL OR invoice_url = '' OR invoice_url ~ '^in_[A-Za-z0-9]+')`,
-      [invoiceUrl, normEmail(email), stripeSessionId]
-    );
-  } catch (e) {
-    // non-fatal
-  }
-}
-
-async function addBalance(email, delta, reason) {
+async function addBalance(email, lypos) {
   const e = normEmail(email);
-  const d = Math.trunc(Number(delta || 0));
-  const { rows } = await pool.query(
-    "UPDATE users SET balance = balance + $2 WHERE email=$1 RETURNING balance",
-    [e, d]
-  );
-  if (!rows[0]) return { ok: false, code: "NO_USER" };
-  return { ok: true, balance: Number(rows[0].balance || 0) };
+  await pool.query("UPDATE users SET balance = balance + $2 WHERE email=$1", [
+    e,
+    Math.max(0, Math.trunc(lypos))
+  ]);
 }
-
 async function chargeBalance(email, cost) {
   const e = normEmail(email);
   const c = Math.max(0, Math.trunc(cost));
@@ -239,26 +278,16 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
     const lypos = Number(session.metadata?.lypos || 0);
     const amountTotal = Number(session.amount_total || 0) / 100;
     const sessionId = session.id;
-    let invoiceUrl = null;
-try {
-  // For one-time payments, Stripe may not create an "invoice". In that case we store the charge receipt URL.
-  if (session.invoice) {
-    const inv = await stripe.invoices.retrieve(String(session.invoice));
-    // Prefer a directly downloadable PDF when available.
-    invoiceUrl = inv.invoice_pdf || inv.hosted_invoice_url || null;
-  } else if (session.payment_intent) {
-    const pi = await stripe.paymentIntents.retrieve(String(session.payment_intent), { expand: ["charges"] });
-    const charge = pi?.charges?.data?.[0];
-    invoiceUrl = charge?.receipt_url || null;
-  }
-} catch (e) {
-  invoiceUrl = null;
-}
+    const invoiceUrl = await resolveInvoiceOrReceiptUrlFromSession(session);
 
     if (email && lypos > 0) {
       try {
-        await recordPayment({ email, stripeSessionId: sessionId, amountUsd: amountTotal, lypos, status: "completed", invoiceUrl });
-        await addBalance(email, lypos);
+        await creditIfFirstTime({ email, stripeSessionId: sessionId, amountUsd: amountTotal, lypos, status: "completed", invoiceUrl });
+        console.log("✅ Payment stored (webhook):", { email, lypos, amountTotal });
+      } catch (e) {
+        console.log("⚠️ Webhook credit failed:", e?.message || e);
+      }
+    }
         console.log("✅ Payment stored + credited LYPOS:", { email, lypos, amountTotal });
       } catch (e) {
         console.log("⚠️ Webhook credit failed:", e?.message || e);
@@ -309,41 +338,6 @@ app.get("/api/auth/me", auth, async (req, res) => {
 });
 
 // ---- Credits
-
-function parseAdminEmails() {
-  const one = (process.env.ADMIN_EMAIL || "").trim();
-  const many = (process.env.ADMIN_EMAILS || "").split(",").map(s => s.trim()).filter(Boolean);
-  const set = new Set();
-  if (one) set.add(one.toLowerCase());
-  for (const e of many) set.add(e.toLowerCase());
-  return set;
-}
-function isAdminEmail(email) {
-  if (!email) return false;
-  const admins = parseAdminEmails();
-  return admins.has(String(email).toLowerCase());
-}
-
-app.get("/api/admin/status", auth, async (req, res) => {
-  return res.json({ isAdmin: isAdminEmail(req.user?.email), email: req.user?.email || null });
-});
-
-app.post("/api/admin/add-credits", auth, async (req, res) => {
-  if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
-
-  const email = String(req.body?.email || "").trim().toLowerCase();
-  const amount = Number(req.body?.amount || 0);
-  const reason = String(req.body?.reason || "").trim();
-
-  if (!email) return res.status(400).json({ error: "MISSING_EMAIL" });
-  if (!Number.isFinite(amount) || amount === 0) return res.status(400).json({ error: "INVALID_AMOUNT" });
-
-  const out = await addBalance(email, amount, reason);
-  if (!out.ok) return res.status(400).json({ error: out.code || "FAILED" });
-
-  return res.json({ ok: true, user: { email, balance: out.balance } });
-});
-
 app.get("/api/credits", auth, async (req, res) => {
   const email = req.user.email;
   const u = await getUserByEmail(email);
@@ -360,7 +354,7 @@ app.post("/api/credits/charge", auth, async (req, res) => {
   const result = await chargeBalance(email, cost);
   if (!result.ok && result.code === "NO_USER") return res.status(401).json({ error: "Invalid user" });
   if (!result.ok && result.code === "INSUFFICIENT") {
-    return res.status(402).json({ error: "INSUFFICIENT_CREDITS", required: cost, balance: result.balance });
+    return res.status(402).json({ error: "INSUFFICIENT_LYPOS", required: cost, balance: result.balance });
   }
   res.json({ charged: cost, remaining: result.balance });
 });
@@ -415,72 +409,28 @@ app.post("/api/stripe/create-checkout-session", auth, async (req, res) => {
   res.json({ url: session.url });
 });
 
-// Confirm Checkout Session on return (fallback if webhook is not configured)
-// Idempotent: will not double-credit if already recorded.
+
+// Confirm a Stripe checkout after redirect (fallback when webhooks are delayed)
 app.get("/api/stripe/confirm", auth, async (req, res) => {
-  const sessionId = String(req.query?.session_id || "").trim();
+  const sessionId = String(req.query?.session_id || "");
   if (!sessionId) return res.status(400).json({ error: "Missing session_id" });
 
-  // Retrieve the session from Stripe
-  const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ["payment_intent", "payment_intent.charges"] });
+  const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ["payment_intent"] });
+  const email = normEmail(req.user.email);
+  const sessionEmail = normEmail(session.customer_email || session.metadata?.email || "");
+  if (!sessionEmail || sessionEmail !== email) return res.status(403).json({ error: "NOT_AUTHORIZED" });
 
-  // Must belong to the logged-in user
-  const email = req.user.email;
-  const sessionEmail = session.customer_email || session.metadata?.email;
-  if (!sessionEmail || String(sessionEmail).toLowerCase() !== String(email).toLowerCase()) {
-    return res.status(403).json({ error: "NOT_AUTHORIZED" });
-  }
+  const paid = session.payment_status === "paid";
+  if (!paid) return res.status(400).json({ error: "NOT_PAID" });
 
-  // Ensure it actually paid
-  if (session.payment_status !== "paid") {
-    return res.status(400).json({ error: "Payment not completed" });
-  }
-
-  const credits = Number(session.metadata?.lypos || session.metadata?.credits || 0);
-  if (!Number.isFinite(credits) || credits <= 0) {
-    return res.status(400).json({ error: "Missing credits metadata" });
-  }
-
+  const lypos = Number(session.metadata?.lypos || 0);
   const amountTotal = Number(session.amount_total || 0) / 100;
+  const invoiceUrl = await resolveInvoiceOrReceiptUrlFromSession(session);
 
-  // Try to resolve an invoice/receipt URL
-  let invoiceUrl = null;
-  try {
-    if (session.invoice) {
-      const inv = await stripe.invoices.retrieve(String(session.invoice));
-      invoiceUrl = inv.invoice_pdf || inv.hosted_invoice_url || null;
-    } else {
-      const pi = session.payment_intent;
-      const charge = pi?.charges?.data?.[0];
-      invoiceUrl = charge?.receipt_url || null;
-    }
-  } catch {
-    invoiceUrl = null;
-  }
+  await creditIfFirstTime({ email, stripeSessionId: session.id, amountUsd: amountTotal, lypos, status: "completed", invoiceUrl });
 
-  // Record payment + credit balance (idempotent because stripe_session_id is UNIQUE)
-  try {
-    await recordPayment({
-      email,
-      stripeSessionId: session.id,
-      amountUsd: amountTotal,
-      lypos: credits,
-      status: "completed",
-      invoiceUrl
-    });
-    await addBalance(email, credits);
-  } catch (e) {
-    // If already recorded, ignore; still return current balance
-    const msg = String(e?.message || "");
-    if (!msg.toLowerCase().includes("duplicate") && !msg.toLowerCase().includes("unique")) {
-      console.log("⚠️ confirm payment failed:", msg);
-    }
-  }
-
-  await updatePaymentInvoice(email, session.id, invoiceUrl);
-
-  const bal = await getBalance(email);
-  res.json({ ok: true, balance: bal, invoice_url: invoiceUrl });
+  const u = await getUserByEmail(email);
+  res.json({ ok: true, balance: Number(u?.balance || 0), invoice_url: invoiceUrl || null });
 });
 
 /* ---------------------------
@@ -614,13 +564,14 @@ app.post("/api/dub-upload", auth, (req, res) => {
 
         // Charge credits server-side (authoritative)
         const seconds = Math.max(1, Number(secondsField || 0));
-        const cost = Math.max(1, Math.ceil(seconds)) * CREDITS_PER_SECOND;
+        const units = Math.max(1, Math.ceil(seconds / 30));
+        const cost = units * PRICE_PER_30S_LYPOS;
 
         const email = req.user.email;
         const charge = await chargeBalance(email, cost);
         if (!charge.ok && charge.code === "NO_USER") return res.status(401).json({ error: "Invalid user" });
         if (!charge.ok && charge.code === "INSUFFICIENT") {
-          return res.status(402).json({ error: "INSUFFICIENT_CREDITS", required: cost, balance: charge.balance });
+          return res.status(402).json({ error: "INSUFFICIENT_LYPOS", required: cost, balance: charge.balance });
         }
 
         const body = Buffer.concat(chunks);
