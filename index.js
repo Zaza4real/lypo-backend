@@ -38,7 +38,6 @@ app.use((req, res, next) => {
    Auth + Credits + Stripe (LYPOS)
 ---------------------------- */
 const LYPOS_PER_USD = 100;
-const CREDITS_PER_SECOND = Number(process.env.CREDITS_PER_SECOND || 10);
 const PRICE_PER_30S_USD = Number(process.env.PRICE_PER_30S_USD || 2.89);
 const PRICE_PER_30S_LYPOS = Math.round(PRICE_PER_30S_USD * LYPOS_PER_USD);
 
@@ -84,8 +83,6 @@ async function initDb() {
       status TEXT NOT NULL DEFAULT 'starting',
       input_url TEXT,
       output_url TEXT,
-      cost_credits INTEGER NOT NULL DEFAULT 0,
-      refunded BOOLEAN NOT NULL DEFAULT false,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
@@ -132,17 +129,17 @@ async function recordPayment({ email, stripeSessionId, amountUsd, lypos, status,
   );
 }
 
-async function upsertVideo({ email, predictionId, status, inputUrl, outputUrl, costCredits }) {
+async function upsertVideo({ email, predictionId, status, inputUrl, outputUrl }) {
   const e = normEmail(email);
   await pool.query(
-    `INSERT INTO videos (email, prediction_id, status, input_url, output_url, cost_credits)
-     VALUES ($1,$2,$3,$4,$5,$6)
+    `INSERT INTO videos (email, prediction_id, status, input_url, output_url)
+     VALUES ($1,$2,$3,$4,$5)
      ON CONFLICT (prediction_id) DO UPDATE SET
        status=EXCLUDED.status,
        input_url=COALESCE(EXCLUDED.input_url, videos.input_url),
        output_url=COALESCE(EXCLUDED.output_url, videos.output_url),
        updated_at=now()`,
-    [e, predictionId || null, status || "starting", inputUrl || null, outputUrl || null, Math.max(0, Math.trunc(costCredits || 0))]
+    [e, predictionId || null, status || "starting", inputUrl || null, outputUrl || null]
   );
 }
 
@@ -471,7 +468,17 @@ app.post("/api/dub-upload", auth, (req, res) => {
         if (!fileInfo) return res.status(400).json({ error: "Missing video file (field name: video)" });
         if (!outputLanguage) return res.status(400).json({ error: "Missing output_language" });
 
-        // Credits are charged server-side AFTER we successfully start a prediction (prevents charging if upload/start fails)
+        // Charge credits server-side (authoritative)
+        const seconds = Math.max(1, Number(secondsField || 0));
+        const units = Math.max(1, Math.ceil(seconds / 30));
+        const cost = units * PRICE_PER_30S_LYPOS;
+
+        const email = req.user.email;
+        const charge = await chargeBalance(email, cost);
+        if (!charge.ok && charge.code === "NO_USER") return res.status(401).json({ error: "Invalid user" });
+        if (!charge.ok && charge.code === "INSUFFICIENT") {
+          return res.status(402).json({ error: "INSUFFICIENT_LYPOS", required: cost, balance: charge.balance });
+        }
 
         const body = Buffer.concat(chunks);
         if (!body.length) return res.status(400).json({ error: "Empty upload or file too large" });
@@ -491,16 +498,7 @@ app.post("/api/dub-upload", auth, (req, res) => {
         const videoUrl = `${base}/${key}`;
 
         const prediction = await createHeygenPrediction({ videoUrl, outputLanguage });
-
-        // Charge credits now that we have a prediction id
-        const email = req.user.email;
-        const charge = await chargeBalance(email, cost);
-        if (!charge.ok && charge.code === "NO_USER") return res.status(401).json({ error: "Invalid user" });
-        if (!charge.ok && charge.code === "INSUFFICIENT") {
-          return res.status(402).json({ error: "INSUFFICIENT_LYPOS", required: cost, balance: charge.balance });
-        }
-
-        await upsertVideo({ email, predictionId: prediction.id, status: prediction.status, inputUrl: videoUrl, costCredits: cost });
+        await upsertVideo({ email, predictionId: prediction.id, status: prediction.status, inputUrl: videoUrl });
 
         res.json({
           id: prediction.id,
@@ -551,18 +549,6 @@ app.get("/api/dub/:id", auth, async (req, res) => {
 
     try {
       await upsertVideo({ email: req.user.email, predictionId: predictionId, status: prediction.status, outputUrl });
-
-      // Refund credits once if prediction failed
-      if (prediction.status === "failed") {
-        const email = normEmail(req.user.email);
-        const { rows } = await pool.query("SELECT cost_credits, refunded FROM videos WHERE prediction_id=$1 AND email=$2", [predictionId, email]);
-        const row = rows[0];
-        if (row && !row.refunded && Number(row.cost_credits || 0) > 0) {
-          await addBalance(email, Number(row.cost_credits || 0));
-          await pool.query("UPDATE videos SET refunded=true, updated_at=now() WHERE prediction_id=$1 AND email=$2", [predictionId, email]);
-          console.log("✅ Refunded credits for failed prediction", predictionId);
-        }
-      }
     } catch (e) {
       console.log("video upsert failed", e?.message || e);
     }
