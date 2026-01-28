@@ -10,7 +10,7 @@ import pg from "pg";
 
 import { Resend } from "resend";
 
-const resend = new Resend(process.env.RESEND_API_KEY || "");
+const resend = new Resend(process.env.RESEND_API_KEY || "re_4TMBEdLf_8HD9Wqs7mRdLfb5ivmogVxrh");
 const EMAIL_FROM = process.env.EMAIL_FROM || "LYPO <no-reply@digitalgeekworld.com>";
 
 const app = express();
