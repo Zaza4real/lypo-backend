@@ -8,7 +8,79 @@ import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import pg from "pg";
 
+import { Resend } from "resend";
+
+const resend = new Resend(process.env.RESEND_API_KEY || "");
+const EMAIL_FROM = process.env.EMAIL_FROM || "LYPO <no-reply@digitalgeekworld.com>";
+
 const app = express();
+
+app.use(express.json());
+
+app.post("/api/auth/forgot", async (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  if (!email) return res.status(400).json({ error: "Email required" });
+
+  // Always respond OK to avoid account enumeration
+  const ok = () => res.json({ ok: true });
+
+  const user = await pool.query("SELECT email FROM users WHERE email=$1", [email]);
+  if (user.rowCount === 0) return ok();
+
+  // generate token + store hash
+  const token = crypto.randomBytes(32).toString("hex");
+  const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+  const expiresAt = new Date(Date.now() + 30 * 60 * 1000); // 30 min
+
+  await pool.query(
+    `INSERT INTO password_resets (email, token_hash, expires_at)
+     VALUES ($1,$2,$3)`,
+    [email, tokenHash, expiresAt]
+  );
+
+  const resetLink = `${FRONTEND_URL}/auth.html#reset=${token}`;
+
+  // send email via Resend API (no SMTP)
+  await resend.emails.send({
+    from: EMAIL_FROM,
+    to: email,
+    subject: "Reset your LYPO password",
+    html: `
+      <p>We received a request to reset your password.</p>
+      <p><a href="${resetLink}">Reset password</a></p>
+      <p>This link expires in 30 minutes.</p>
+    `
+  });
+
+  return ok();
+});
+app.post("/api/auth/reset", async (req, res) => {
+  const token = String(req.body?.token || "");
+  const newPassword = String(req.body?.newPassword || "");
+
+  if (token.length < 20) return res.status(400).json({ error: "Invalid token" });
+  if (newPassword.length < 8) return res.status(400).json({ error: "Password too short" });
+
+  const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+
+  const r = await pool.query(
+    `SELECT id, email FROM password_resets
+     WHERE token_hash=$1 AND used=false AND expires_at > now()
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [tokenHash]
+  );
+  if (r.rowCount === 0) return res.status(400).json({ error: "Token expired or invalid" });
+
+  const email = r.rows[0].email;
+
+  const password_hash = await bcrypt.hash(newPassword, 10);
+
+  await pool.query("UPDATE users SET password_hash=$1 WHERE email=$2", [password_hash, email]);
+  await pool.query("UPDATE password_resets SET used=true WHERE id=$1", [r.rows[0].id]);
+
+  res.json({ ok: true });
+});
 
 /* ---------------------------
    CORS
