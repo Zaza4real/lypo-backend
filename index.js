@@ -125,15 +125,43 @@ async function createUser(email, passwordHash) {
 }
 
 async function recordPayment({ email, stripeSessionId, amountUsd, lypos, status, invoiceUrl }) {
+  // Returns true if a NEW row was inserted. If the session already exists,
+  // the record is updated (status/invoice_url) and we return false.
   const e = normEmail(email);
-  await pool.query(
-    `INSERT INTO payments (email, stripe_session_id, amount_usd, lypos, status, invoice_url)
-     VALUES ($1,$2,$3,$4,$5,$6)
-     ON CONFLICT (stripe_session_id) DO UPDATE SET
-       status=EXCLUDED.status,
-       invoice_url=COALESCE(EXCLUDED.invoice_url, payments.invoice_url)`,
+  const { rows } = await pool.query(
+    `WITH upsert AS (
+      INSERT INTO payments (email, stripe_session_id, amount_usd, lypos, status, invoice_url)
+      VALUES ($1,$2,$3,$4,$5,$6)
+      ON CONFLICT (stripe_session_id) DO UPDATE SET
+        status=EXCLUDED.status,
+        invoice_url=COALESCE(EXCLUDED.invoice_url, payments.invoice_url)
+      RETURNING (xmax = 0) AS inserted
+    )
+    SELECT inserted FROM upsert;`,
     [e, stripeSessionId || null, Number(amountUsd||0), Math.trunc(lypos||0), status || "completed", invoiceUrl || null]
   );
+  return Boolean(rows?.[0]?.inserted);
+}
+
+async function resolveInvoiceOrReceiptUrlFromSession(session) {
+  try {
+    if (session?.invoice) {
+      const inv = await stripe.invoices.retrieve(String(session.invoice));
+      return inv.invoice_pdf || inv.hosted_invoice_url || null;
+    }
+
+    // For one-time payments, prefer the card receipt URL.
+    const piObj = session?.payment_intent;
+    const piId = (typeof piObj === "string") ? piObj : (piObj?.id || "");
+    if (!piId) return null;
+
+    // Retrieve again to be robust across Stripe API versions; expand charges.
+    const pi = await stripe.paymentIntents.retrieve(piId, { expand: ["charges", "latest_charge"] });
+    const charge = pi?.charges?.data?.[0] || (typeof pi?.latest_charge === "object" ? pi.latest_charge : null);
+    return charge?.receipt_url || null;
+  } catch {
+    return null;
+  }
 }
 
 async function upsertVideo({ email, predictionId, status, inputUrl, outputUrl }) {
@@ -223,26 +251,12 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
     const lypos = Number(session.metadata?.lypos || 0);
     const amountTotal = Number(session.amount_total || 0) / 100;
     const sessionId = session.id;
-    let invoiceUrl = null;
-try {
-  // For one-time payments, Stripe may not create an "invoice". In that case we store the charge receipt URL.
-  if (session.invoice) {
-    const inv = await stripe.invoices.retrieve(String(session.invoice));
-    // Prefer a directly downloadable PDF when available.
-    invoiceUrl = inv.invoice_pdf || inv.hosted_invoice_url || null;
-  } else if (session.payment_intent) {
-    const pi = await stripe.paymentIntents.retrieve(String(session.payment_intent), { expand: ["charges"] });
-    const charge = pi?.charges?.data?.[0];
-    invoiceUrl = charge?.receipt_url || null;
-  }
-} catch (e) {
-  invoiceUrl = null;
-}
+    const invoiceUrl = await resolveInvoiceOrReceiptUrlFromSession(session);
 
     if (email && lypos > 0) {
       try {
-        await recordPayment({ email, stripeSessionId: sessionId, amountUsd: amountTotal, lypos, status: "completed", invoiceUrl });
-        await addBalance(email, lypos);
+        const inserted = await recordPayment({ email, stripeSessionId: sessionId, amountUsd: amountTotal, lypos, status: "completed", invoiceUrl });
+        if (inserted) await addBalance(email, lypos);
         console.log("✅ Payment stored + credited LYPOS:", { email, lypos, amountTotal });
       } catch (e) {
         console.log("⚠️ Webhook credit failed:", e?.message || e);
@@ -357,6 +371,27 @@ app.get("/api/account/payments", auth, async (req, res) => {
     "SELECT stripe_session_id, amount_usd, lypos, status, invoice_url, created_at FROM payments WHERE email=$1 ORDER BY created_at DESC LIMIT 100",
     [email]
   );
+
+  // Best-effort backfill: if a payment exists without an invoice/receipt URL,
+  // try to resolve it from Stripe and persist it for future dashboard views.
+  // (No balance changes here.)
+  const missing = rows.filter(r => r.stripe_session_id && !r.invoice_url).slice(0, 5);
+  for (const r of missing) {
+    try {
+      const session = await stripe.checkout.sessions.retrieve(String(r.stripe_session_id), { expand: ["payment_intent", "payment_intent.charges"] });
+      const url = await resolveInvoiceOrReceiptUrlFromSession(session);
+      if (url) {
+        await pool.query(
+          "UPDATE payments SET invoice_url=$2 WHERE stripe_session_id=$1 AND invoice_url IS NULL",
+          [String(r.stripe_session_id), url]
+        );
+        r.invoice_url = url;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
   res.json({ payments: rows });
 });
 
@@ -427,24 +462,12 @@ app.get("/api/stripe/confirm", auth, async (req, res) => {
 
   const amountTotal = Number(session.amount_total || 0) / 100;
 
-  // Try to resolve an invoice/receipt URL
-  let invoiceUrl = null;
-  try {
-    if (session.invoice) {
-      const inv = await stripe.invoices.retrieve(String(session.invoice));
-      invoiceUrl = inv.invoice_pdf || inv.hosted_invoice_url || null;
-    } else {
-      const pi = session.payment_intent;
-      const charge = pi?.charges?.data?.[0];
-      invoiceUrl = charge?.receipt_url || null;
-    }
-  } catch {
-    invoiceUrl = null;
-  }
+  // Resolve an invoice/receipt URL (stored and later shown in Dashboard)
+  const invoiceUrl = await resolveInvoiceOrReceiptUrlFromSession(session);
 
-  // Record payment + credit balance (idempotent because stripe_session_id is UNIQUE)
+  // Record payment + credit balance (truly idempotent: credit only on first insert)
   try {
-    await recordPayment({
+    const inserted = await recordPayment({
       email,
       stripeSessionId: session.id,
       amountUsd: amountTotal,
@@ -452,13 +475,9 @@ app.get("/api/stripe/confirm", auth, async (req, res) => {
       status: "completed",
       invoiceUrl
     });
-    await addBalance(email, credits);
+    if (inserted) await addBalance(email, credits);
   } catch (e) {
-    // If already recorded, ignore; still return current balance
-    const msg = String(e?.message || "");
-    if (!msg.toLowerCase().includes("duplicate") && !msg.toLowerCase().includes("unique")) {
-      console.log("⚠️ confirm payment failed:", msg);
-    }
+    console.log("⚠️ confirm payment failed:", String(e?.message || e));
   }
 
   const bal = await getBalance(email);
