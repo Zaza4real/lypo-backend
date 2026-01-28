@@ -41,6 +41,178 @@ function chargeCredits(userId, amount){
   return next;
 }
 
+import Stripe from "stripe";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
+
+// ---- Stripe + Auth + Credits config
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "");
+const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
+const JWT_SECRET = process.env.JWT_SECRET || "dev_change_me";
+
+// Credits model
+const LYPOS_PER_USD = 100;
+const PRICE_PER_30S_USD = Number(process.env.PRICE_PER_30S_USD || 2.89);
+const PRICE_PER_30S_LYPOS = Math.round(PRICE_PER_30S_USD * LYPOS_PER_USD);
+
+// ---- SUPER SIMPLE in-memory “DB” (works now; later swap to Postgres)
+// userEmail -> { passwordHash, balance }
+const users = new Map();
+
+function publicUser(email) {
+  const u = users.get(email);
+  return { email, balance: Number(u?.balance || 0) };
+}
+
+function signToken(email) {
+  return jwt.sign({ email }, JWT_SECRET, { expiresIn: "30d" });
+}
+
+function auth(req, res, next) {
+  const h = req.headers.authorization || "";
+  const token = h.startsWith("Bearer ") ? h.slice(7) : "";
+  if (!token) return res.status(401).json({ error: "NOT_AUTHENTICATED" });
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    return next();
+  } catch {
+    return res.status(401).json({ error: "INVALID_TOKEN" });
+  }
+}
+
+// ---------------------------
+// Stripe webhook (RAW body) — MUST be before express.json()
+// ---------------------------
+app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), (req, res) => {
+  const sig = req.headers["stripe-signature"];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === "checkout.session.completed") {
+    const session = event.data.object;
+    const email = session.metadata?.email;
+    const lypos = Number(session.metadata?.lypos || 0);
+
+    if (email && lypos > 0 && users.has(email)) {
+      const u = users.get(email);
+      u.balance = Number(u.balance || 0) + lypos;
+      users.set(email, u);
+      console.log("✅ Credited LYPOS", { email, lypos, balance: u.balance });
+    }
+  }
+
+  res.json({ received: true });
+});
+
+// Now your normal JSON middleware can be used:
+app.use(express.json({ limit: "2mb" }));
+
+// ---------------------------
+// Auth routes
+// ---------------------------
+app.post("/api/auth/signup", async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) return res.status(400).json({ error: "Missing email/password" });
+  if (String(password).length < 6) return res.status(400).json({ error: "Password too short (min 6)" });
+
+  const e = String(email).toLowerCase();
+  if (users.has(e)) return res.status(409).json({ error: "Email already registered" });
+
+  const passwordHash = await bcrypt.hash(String(password), 10);
+  users.set(e, { passwordHash, balance: 0 });
+
+  const token = signToken(e);
+  res.json({ token, user: publicUser(e) });
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) return res.status(400).json({ error: "Missing email/password" });
+
+  const e = String(email).toLowerCase();
+  const u = users.get(e);
+  if (!u) return res.status(401).json({ error: "Invalid credentials" });
+
+  const ok = await bcrypt.compare(String(password), String(u.passwordHash));
+  if (!ok) return res.status(401).json({ error: "Invalid credentials" });
+
+  const token = signToken(e);
+  res.json({ token, user: publicUser(e) });
+});
+
+app.get("/api/auth/me", auth, (req, res) => {
+  const email = req.user.email;
+  if (!users.has(email)) return res.status(401).json({ error: "Invalid user" });
+  res.json({ user: publicUser(email) });
+});
+
+// ---------------------------
+// Credits routes
+// ---------------------------
+app.get("/api/credits", auth, (req, res) => {
+  const email = req.user.email;
+  res.json({ balance: publicUser(email).balance });
+});
+
+app.post("/api/credits/charge", auth, (req, res) => {
+  const email = req.user.email;
+  const { seconds } = req.body || {};
+  const s = Number(seconds || 0);
+  const units = Math.max(1, Math.ceil(s / 30));
+  const cost = units * PRICE_PER_30S_LYPOS;
+
+  const u = users.get(email);
+  const bal = Number(u?.balance || 0);
+  if (bal < cost) return res.status(402).json({ error: "INSUFFICIENT_LYPOS", required: cost, balance: bal });
+
+  u.balance = bal - cost;
+  users.set(email, u);
+
+  res.json({ charged: cost, remaining: u.balance });
+});
+
+// ---------------------------
+// Stripe checkout route (buy LYPOS)
+// ---------------------------
+app.post("/api/stripe/create-checkout-session", auth, async (req, res) => {
+  const email = req.user.email;
+  const { usd } = req.body || {};
+  const dollars = Number(usd || 0);
+
+  if (!Number.isFinite(dollars) || dollars <= 0) {
+    return res.status(400).json({ error: "Invalid usd" });
+  }
+
+  const lypos = Math.round(dollars * LYPOS_PER_USD);
+
+  const session = await stripe.checkout.sessions.create({
+    mode: "payment",
+    customer_email: email,
+    line_items: [
+      {
+        price_data: {
+          currency: "usd",
+          unit_amount: Math.round(dollars * 100),
+          product_data: { name: `${lypos} LYPOS` }
+        },
+        quantity: 1
+      }
+    ],
+    metadata: { email, lypos: String(lypos) },
+    success_url: `${FRONTEND_URL}/?paid=1`,
+    cancel_url: `${FRONTEND_URL}/?paid=0`
+  });
+
+  res.json({ url: session.url });
+});
+
 
 /* ---------------------------
    CORS (demo-friendly)
