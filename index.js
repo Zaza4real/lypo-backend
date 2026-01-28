@@ -150,13 +150,17 @@ async function upsertVideo({ email, predictionId, status, inputUrl, outputUrl })
   );
 }
 
-async function addBalance(email, lypos) {
+async function addBalance(email, delta, reason) {
   const e = normEmail(email);
-  await pool.query("UPDATE users SET balance = balance + $2 WHERE email=$1", [
-    e,
-    Math.max(0, Math.trunc(lypos))
-  ]);
+  const d = Math.trunc(Number(delta || 0));
+  const { rows } = await pool.query(
+    "UPDATE users SET balance = balance + $2 WHERE email=$1 RETURNING balance",
+    [e, d]
+  );
+  if (!rows[0]) return { ok: false, code: "NO_USER" };
+  return { ok: true, balance: Number(rows[0].balance || 0) };
 }
+
 async function chargeBalance(email, cost) {
   const e = normEmail(email);
   const c = Math.max(0, Math.trunc(cost));
@@ -275,6 +279,41 @@ app.get("/api/auth/me", auth, async (req, res) => {
 });
 
 // ---- Credits
+
+function parseAdminEmails() {
+  const one = (process.env.ADMIN_EMAIL || "").trim();
+  const many = (process.env.ADMIN_EMAILS || "").split(",").map(s => s.trim()).filter(Boolean);
+  const set = new Set();
+  if (one) set.add(one.toLowerCase());
+  for (const e of many) set.add(e.toLowerCase());
+  return set;
+}
+function isAdminEmail(email) {
+  if (!email) return false;
+  const admins = parseAdminEmails();
+  return admins.has(String(email).toLowerCase());
+}
+
+app.get("/api/admin/status", auth, async (req, res) => {
+  return res.json({ isAdmin: isAdminEmail(req.user?.email), email: req.user?.email || null });
+});
+
+app.post("/api/admin/add-credits", auth, async (req, res) => {
+  if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
+
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const amount = Number(req.body?.amount || 0);
+  const reason = String(req.body?.reason || "").trim();
+
+  if (!email) return res.status(400).json({ error: "MISSING_EMAIL" });
+  if (!Number.isFinite(amount) || amount === 0) return res.status(400).json({ error: "INVALID_AMOUNT" });
+
+  const out = await addBalance(email, amount, reason);
+  if (!out.ok) return res.status(400).json({ error: out.code || "FAILED" });
+
+  return res.json({ ok: true, user: { email, balance: out.balance } });
+});
+
 app.get("/api/credits", auth, async (req, res) => {
   const email = req.user.email;
   const u = await getUserByEmail(email);
@@ -291,7 +330,7 @@ app.post("/api/credits/charge", auth, async (req, res) => {
   const result = await chargeBalance(email, cost);
   if (!result.ok && result.code === "NO_USER") return res.status(401).json({ error: "Invalid user" });
   if (!result.ok && result.code === "INSUFFICIENT") {
-    return res.status(402).json({ error: "INSUFFICIENT_LYPOS", required: cost, balance: result.balance });
+    return res.status(402).json({ error: "INSUFFICIENT_CREDITS", required: cost, balance: result.balance });
   }
   res.json({ charged: cost, remaining: result.balance });
 });
@@ -477,14 +516,13 @@ app.post("/api/dub-upload", auth, (req, res) => {
 
         // Charge credits server-side (authoritative)
         const seconds = Math.max(1, Number(secondsField || 0));
-        const secs = Math.max(1, Math.ceil(seconds));
-        const cost = secs * CREDITS_PER_SECOND;
+        const cost = Math.max(1, Math.ceil(seconds)) * CREDITS_PER_SECOND;
 
         const email = req.user.email;
         const charge = await chargeBalance(email, cost);
         if (!charge.ok && charge.code === "NO_USER") return res.status(401).json({ error: "Invalid user" });
         if (!charge.ok && charge.code === "INSUFFICIENT") {
-          return res.status(402).json({ error: "INSUFFICIENT_LYPOS", required: cost, balance: charge.balance });
+          return res.status(402).json({ error: "INSUFFICIENT_CREDITS", required: cost, balance: charge.balance });
         }
 
         const body = Buffer.concat(chunks);
