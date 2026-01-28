@@ -75,6 +75,17 @@ async function initDb() {
     CREATE INDEX IF NOT EXISTS password_resets_email_idx ON password_resets(email);
     CREATE INDEX IF NOT EXISTS password_resets_token_hash_idx ON password_resets(token_hash);
 `);
+   await pool.query(`
+  CREATE TABLE IF NOT EXISTS password_resets (
+    id BIGSERIAL PRIMARY KEY,
+    email TEXT NOT NULL,
+    token_hash TEXT NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    used BOOLEAN NOT NULL DEFAULT false,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  );
+`);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS payments (
       id BIGSERIAL PRIMARY KEY,
