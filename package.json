@@ -21,3 +21,11 @@
   "author": "",
   "license": "ISC"
 }
+{
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2",
+    "stripe": "^16.9.0"
+  }
+}
+
