@@ -223,7 +223,20 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
     const lypos = Number(session.metadata?.lypos || 0);
     const amountTotal = Number(session.amount_total || 0) / 100;
     const sessionId = session.id;
-    const invoiceUrl = session.invoice ? String(session.invoice) : null;
+    let invoiceUrl = null;
+try {
+  // For one-time payments, Stripe may not create an "invoice". In that case we store the charge receipt URL.
+  if (session.invoice) {
+    const inv = await stripe.invoices.retrieve(String(session.invoice));
+    invoiceUrl = inv.hosted_invoice_url || inv.invoice_pdf || null;
+  } else if (session.payment_intent) {
+    const pi = await stripe.paymentIntents.retrieve(String(session.payment_intent), { expand: ["charges"] });
+    const charge = pi?.charges?.data?.[0];
+    invoiceUrl = charge?.receipt_url || null;
+  }
+} catch (e) {
+  invoiceUrl = null;
+}
 
     if (email && lypos > 0) {
       try {
