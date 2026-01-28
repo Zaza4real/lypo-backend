@@ -63,7 +63,18 @@ async function initDb() {
       balance INTEGER NOT NULL DEFAULT 0,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
-  `);
+  
+    CREATE TABLE IF NOT EXISTS password_resets (
+      id BIGSERIAL PRIMARY KEY,
+      email TEXT NOT NULL,
+      token_hash TEXT NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL,
+      used_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS password_resets_email_idx ON password_resets(email);
+    CREATE INDEX IF NOT EXISTS password_resets_token_hash_idx ON password_resets(token_hash);
+`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS payments (
       id BIGSERIAL PRIMARY KEY,
@@ -105,6 +116,38 @@ function publicUserRow(r) {
 }
 function signToken(email) {
   return jwt.sign({ email }, JWT_SECRET, { expiresIn: "30d" });
+}
+
+async function sendPasswordResetEmail(toEmail, resetUrl) {
+  // If SMTP isn't configured, log the URL for development/testing.
+  const host = process.env.SMTP_HOST;
+  const port = Number(process.env.SMTP_PORT || "587");
+  const user = process.env.SMTP_USER;
+  const pass = process.env.SMTP_PASS;
+  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
+
+  if (!host || !from || !user || !pass) {
+    console.log("🔑 Password reset link (SMTP not configured):", resetUrl);
+    return;
+  }
+
+  const transporter = nodemailer.createTransport({
+    host,
+    port,
+    secure: port === 465,
+    auth: { user, pass }
+  });
+
+  await transporter.sendMail({
+    from,
+    to: toEmail,
+    subject: "Reset your LYPO password",
+    text: `Reset your password using this link (valid for 1 hour):\n\n${resetUrl}\n\nIf you didn't request this, you can ignore this email.`
+  });
+}
+
+function sha256Hex(s) {
+  return crypto.createHash("sha256").update(String(s)).digest("hex");
 }
 
 async function getUserByEmail(email) {
@@ -305,6 +348,60 @@ app.get("/api/auth/me", auth, async (req, res) => {
   if (!u) return res.status(401).json({ error: "Invalid user" });
   res.json({ user: publicUserRow(u) });
 });
+app.post("/api/auth/forgot-password", async (req, res) => {
+  const { email } = req.body || {};
+  const e = email ? normEmail(email) : "";
+  // Always return ok to avoid email enumeration
+  try {
+    if (e) {
+      const u = await getUserByEmail(e);
+      if (u) {
+        const token = crypto.randomBytes(24).toString("hex");
+        const tokenHash = sha256Hex(token);
+        const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+        await pool.query(
+          "INSERT INTO password_resets (email, token_hash, expires_at) VALUES ($1,$2,$3)",
+          [e, tokenHash, expiresAt]
+        );
+
+        const appUrl = (process.env.APP_URL || process.env.FRONTEND_URL || "").replace(/\/$/, "");
+        const base = appUrl || "http://localhost:3000";
+        const resetUrl = `${base}/auth.html#reset=${encodeURIComponent(token)}&email=${encodeURIComponent(e)}`;
+        await sendPasswordResetEmail(e, resetUrl);
+      }
+    }
+  } catch (err) {
+    console.error("forgot-password error:", err?.message || err);
+  }
+  res.json({ ok: true });
+});
+
+app.post("/api/auth/reset-password", async (req, res) => {
+  const { email, token, newPassword } = req.body || {};
+  if (!email || !token || !newPassword) return res.status(400).json({ error: "Missing email/token/password" });
+  if (String(newPassword).length < 6) return res.status(400).json({ error: "Password too short (min 6)" });
+
+  const e = normEmail(email);
+  const tokenHash = sha256Hex(token);
+
+  const r = await pool.query(
+    "SELECT * FROM password_resets WHERE email=$1 AND token_hash=$2 AND used_at IS NULL ORDER BY created_at DESC LIMIT 1",
+    [e, tokenHash]
+  );
+  const row = r.rows?.[0];
+  if (!row) return res.status(400).json({ error: "Invalid or expired reset link" });
+
+  const exp = new Date(row.expires_at);
+  if (Date.now() > exp.getTime()) return res.status(400).json({ error: "Invalid or expired reset link" });
+
+  const passwordHash = await bcrypt.hash(String(newPassword), 10);
+  await pool.query("UPDATE users SET password_hash=$1 WHERE email=$2", [passwordHash, e]);
+  await pool.query("UPDATE password_resets SET used_at=now() WHERE id=$1", [row.id]);
+
+  res.json({ ok: true });
+});
+
 
 // ---- Credits
 
