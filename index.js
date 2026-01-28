@@ -119,6 +119,17 @@ const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
 const JWT_SECRET = process.env.JWT_SECRET || "dev_change_me";
 
+// Resend (transactional email API for password reset)
+const resend = new Resend(process.env.RESEND_API_KEY || "");
+const EMAIL_FROM = process.env.EMAIL_FROM || "LYPO <no-reply@digitalgeekworld.com>";
+
+function normalizeBaseUrl(url) {
+  const u = String(url || "").trim();
+  if (!u) return "";
+  if (u.startsWith("http://") || u.startsWith("https://")) return u.replace(/\/$/, "");
+  return `https://${u.replace(/\/$/, "")}`;
+}
+
 // ---- Postgres
 const { Pool } = pg;
 const pool = new Pool({
@@ -202,36 +213,33 @@ function signToken(email) {
 }
 
 async function sendPasswordResetEmail(toEmail, resetUrl) {
-  // If SMTP isn't configured, log the URL for development/testing.
-  const host = process.env.SMTP_HOST;
-  const port = Number(process.env.SMTP_PORT || "587");
-  const user = process.env.SMTP_USER;
-  const pass = process.env.SMTP_PASS;
-  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
-
-  if (!host || !from || !user || !pass) {
-    console.log("🔑 Password reset link (SMTP not configured):", resetUrl);
+  // If RESEND_API_KEY isn't configured, log the URL for development/testing.
+  if (!process.env.RESEND_API_KEY) {
+    console.log("🔑 Password reset link (RESEND_API_KEY not configured):", resetUrl);
     return;
   }
 
-  const transporter = nodemailer.createTransport({
-    host,
-    port,
-    secure: port === 465,
-    auth: { user, pass }
-  });
-
-  await transporter.sendMail({
-    from,
-    to: toEmail,
-    subject: "Reset your LYPO password",
-    text: `Reset your password using this link (valid for 1 hour):\n\n${resetUrl}\n\nIf you didn't request this, you can ignore this email.`
-  });
+  try {
+    await resend.emails.send({
+      from: EMAIL_FROM,
+      to: toEmail,
+      subject: "Reset your LYPO password",
+      html: `
+        <p>We received a request to reset your password.</p>
+        <p><a href="${resetUrl}">Reset password</a></p>
+        <p>This link expires in 60 minutes.</p>
+        <p>If you didn’t request this, you can ignore this email.</p>
+      `
+    });
+    console.log("✅ Password reset email sent to:", toEmail);
+  } catch (err) {
+    // Log detailed info to Render logs to debug domain/permission problems.
+    console.error("❌ Resend send failed:", err?.message || err);
+    // Still log the link so you can test even if Resend rejects send.
+    console.log("🔑 Password reset link (Resend send failed):", resetUrl);
+  }
 }
 
-function sha256Hex(s) {
-  return crypto.createHash("sha256").update(String(s)).digest("hex");
-}
 
 async function getUserByEmail(email) {
   const e = normEmail(email);
