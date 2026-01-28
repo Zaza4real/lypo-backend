@@ -15,7 +15,8 @@
     "replicate": "^0.18.1",
     "stripe": "^16.9.0",
     "jsonwebtoken": "^9.0.2",
-    "bcryptjs": "^2.4.3"
+    "bcryptjs": "^2.4.3",
+    "pg": "^8.11.5"
   },
   "description": "",
   "main": "index.js",
