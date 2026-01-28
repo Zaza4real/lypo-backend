@@ -206,8 +206,10 @@ function auth(req, res, next) {
 // ---- Admin guard
 // Backend env: ADMIN_EMAILS="admin1@example.com,admin2@example.com"
 function adminAllowSet() {
+  // Support both ADMIN_EMAILS (comma-separated) and legacy ADMIN_EMAIL (single email)
+  const raw = String(process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || "");
   return new Set(
-    String(process.env.ADMIN_EMAILS || "")
+    raw
       .split(",")
       .map((s) => s.trim().toLowerCase())
       .filter(Boolean)
