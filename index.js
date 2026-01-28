@@ -1,94 +1,85 @@
 import express from "express";
+import Stripe from "stripe";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
+import fs from "fs";
 import Replicate from "replicate";
 import Busboy from "busboy";
 import crypto from "crypto";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
-import Stripe from "stripe";
 
 const app = express();
 
 /* ---------------------------
-   Credits (LYPOS) — demo store
-   1 USD = 100 LYPOS
-   NOTE: replace with DB in production.
+   CORS (demo-friendly)
 ---------------------------- */
-const LYPOS_PER_USD = 100;
-const PRICE_PER_30S_LYPOS = 289;
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
 
-const creditsStore = new Map();
-function getBalance(userId){
-  if (!userId) return 0;
-  if (!creditsStore.has(userId)) creditsStore.set(userId, 0);
-  return creditsStore.get(userId) || 0;
-}
-function addCredits(userId, amount){
-  const bal = getBalance(userId);
-  const next = Math.max(0, bal + Number(amount || 0));
-  creditsStore.set(userId, next);
-  return next;
-}
-function chargeCredits(userId, amount){
-  const bal = getBalance(userId);
-  const a = Number(amount || 0);
-  if (bal < a){
-    const err = new Error('INSUFFICIENT_LYPOS');
-    err.statusCode = 402;
-    err.meta = { required: a, balance: bal };
-    throw err;
-  }
-  const next = bal - a;
-  creditsStore.set(userId, next);
-  return next;
-}
-
-import Stripe from "stripe";
-import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
-
-// ---- Stripe + Auth + Credits config
+/* ---------------------------
+   Auth + Credits + Stripe
+---------------------------- */
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "");
-const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
+const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
 const JWT_SECRET = process.env.JWT_SECRET || "dev_change_me";
 
-// Credits model
 const LYPOS_PER_USD = 100;
 const PRICE_PER_30S_USD = Number(process.env.PRICE_PER_30S_USD || 2.89);
 const PRICE_PER_30S_LYPOS = Math.round(PRICE_PER_30S_USD * LYPOS_PER_USD);
 
-// ---- SUPER SIMPLE in-memory “DB” (works now; later swap to Postgres)
-// userEmail -> { passwordHash, balance }
-const users = new Map();
+const USERS_FILE = new URL("./users.json", import.meta.url).pathname;
 
-function publicUser(email) {
-  const u = users.get(email);
-  return { email, balance: Number(u?.balance || 0) };
+function loadUsers() {
+  try {
+    if (!fs.existsSync(USERS_FILE)) return {};
+    const raw = fs.readFileSync(USERS_FILE, "utf-8");
+    const data = JSON.parse(raw || "{}");
+    return data.users || {};
+  } catch (e) {
+    console.error("Failed to load users.json:", e);
+    return {};
+  }
 }
+function saveUsers(users) {
+  try {
+    fs.writeFileSync(USERS_FILE, JSON.stringify({ users }, null, 2));
+  } catch (e) {
+    console.error("Failed to save users.json:", e);
+  }
+}
+let USERS = loadUsers();
 
 function signToken(email) {
   return jwt.sign({ email }, JWT_SECRET, { expiresIn: "30d" });
 }
-
-function auth(req, res, next) {
+function getAuthEmail(req) {
   const h = req.headers.authorization || "";
   const token = h.startsWith("Bearer ") ? h.slice(7) : "";
-  if (!token) return res.status(401).json({ error: "NOT_AUTHENTICATED" });
+  if (!token) return null;
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded;
-    return next();
+    return decoded?.email || null;
   } catch {
-    return res.status(401).json({ error: "INVALID_TOKEN" });
+    return null;
   }
 }
+function requireAuth(req, res, next) {
+  const email = getAuthEmail(req);
+  if (!email || !USERS[email]) return res.status(401).json({ error: "NOT_AUTHENTICATED" });
+  req.userEmail = email;
+  next();
+}
 
-// ---------------------------
-// Stripe webhook (RAW body) — MUST be before express.json()
-// ---------------------------
+// Stripe webhook needs RAW body and must be registered before express.json()
 app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), (req, res) => {
   const sig = req.headers["stripe-signature"];
   let event;
-
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
   } catch (err) {
@@ -100,160 +91,107 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), (req,
     const email = session.metadata?.email;
     const lypos = Number(session.metadata?.lypos || 0);
 
-    if (email && lypos > 0 && users.has(email)) {
-      const u = users.get(email);
-      u.balance = Number(u.balance || 0) + lypos;
-      users.set(email, u);
-      console.log("✅ Credited LYPOS", { email, lypos, balance: u.balance });
+    if (email && USERS[email] && lypos > 0) {
+      USERS[email].balance = Number(USERS[email].balance || 0) + lypos;
+      saveUsers(USERS);
+      console.log("✅ Credited LYPOS:", { email, lypos, balance: USERS[email].balance });
     }
   }
 
   res.json({ received: true });
 });
 
-// Now your normal JSON middleware can be used:
+// JSON routes (everything except webhook)
 app.use(express.json({ limit: "2mb" }));
 
-// ---------------------------
-// Auth routes
-// ---------------------------
+/* Auth routes */
 app.post("/api/auth/signup", async (req, res) => {
-  const { email, password } = req.body || {};
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const password = String(req.body?.password || "");
   if (!email || !password) return res.status(400).json({ error: "Missing email/password" });
-  if (String(password).length < 6) return res.status(400).json({ error: "Password too short (min 6)" });
+  if (password.length < 6) return res.status(400).json({ error: "Password too short (min 6)" });
+  if (USERS[email]) return res.status(409).json({ error: "Email already registered" });
 
-  const e = String(email).toLowerCase();
-  if (users.has(e)) return res.status(409).json({ error: "Email already registered" });
+  const passwordHash = await bcrypt.hash(password, 10);
+  USERS[email] = { passwordHash, balance: 0 };
+  saveUsers(USERS);
 
-  const passwordHash = await bcrypt.hash(String(password), 10);
-  users.set(e, { passwordHash, balance: 0 });
-
-  const token = signToken(e);
-  res.json({ token, user: publicUser(e) });
+  res.json({ token: signToken(email), user: { email, balance: 0 } });
 });
 
 app.post("/api/auth/login", async (req, res) => {
-  const { email, password } = req.body || {};
-  if (!email || !password) return res.status(400).json({ error: "Missing email/password" });
-
-  const e = String(email).toLowerCase();
-  const u = users.get(e);
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const password = String(req.body?.password || "");
+  const u = USERS[email];
   if (!u) return res.status(401).json({ error: "Invalid credentials" });
 
-  const ok = await bcrypt.compare(String(password), String(u.passwordHash));
+  const ok = await bcrypt.compare(password, String(u.passwordHash || ""));
   if (!ok) return res.status(401).json({ error: "Invalid credentials" });
 
-  const token = signToken(e);
-  res.json({ token, user: publicUser(e) });
+  res.json({ token: signToken(email), user: { email, balance: Number(u.balance || 0) } });
 });
 
-app.get("/api/auth/me", auth, (req, res) => {
-  const email = req.user.email;
-  if (!users.has(email)) return res.status(401).json({ error: "Invalid user" });
-  res.json({ user: publicUser(email) });
+app.get("/api/auth/me", (req, res) => {
+  const email = getAuthEmail(req);
+  if (!email || !USERS[email]) return res.status(401).json({ error: "NOT_AUTHENTICATED" });
+  const u = USERS[email];
+  res.json({ user: { email, balance: Number(u.balance || 0) } });
 });
 
-// ---------------------------
-// Credits routes
-// ---------------------------
-app.get("/api/credits", auth, (req, res) => {
-  const email = req.user.email;
-  res.json({ balance: publicUser(email).balance });
+/* Credits */
+app.get("/api/credits", requireAuth, (req, res) => {
+  const u = USERS[req.userEmail];
+  res.json({ balance: Number(u.balance || 0) });
 });
 
-app.post("/api/credits/charge", auth, (req, res) => {
-  const email = req.user.email;
-  const { seconds } = req.body || {};
-  const s = Number(seconds || 0);
-  const units = Math.max(1, Math.ceil(s / 30));
+app.post("/api/credits/charge", requireAuth, (req, res) => {
+  const seconds = Number(req.body?.seconds || 0);
+  const units = Math.max(1, Math.ceil((Number.isFinite(seconds) ? seconds : 0) / 30));
   const cost = units * PRICE_PER_30S_LYPOS;
 
-  const u = users.get(email);
-  const bal = Number(u?.balance || 0);
-  if (bal < cost) return res.status(402).json({ error: "INSUFFICIENT_LYPOS", required: cost, balance: bal });
+  const u = USERS[req.userEmail];
+  const bal = Number(u.balance || 0);
+  if (bal < cost) {
+    return res.status(402).json({ error: "INSUFFICIENT_LYPOS", required: cost, balance: bal });
+  }
 
   u.balance = bal - cost;
-  users.set(email, u);
-
+  saveUsers(USERS);
   res.json({ charged: cost, remaining: u.balance });
 });
 
-// ---------------------------
-// Stripe checkout route (buy LYPOS)
-// ---------------------------
-app.post("/api/stripe/create-checkout-session", auth, async (req, res) => {
-  const email = req.user.email;
-  const { usd } = req.body || {};
-  const dollars = Number(usd || 0);
+/* Stripe checkout: buy LYPOS */
+app.post("/api/stripe/create-checkout-session", requireAuth, async (req, res) => {
+  if (!process.env.STRIPE_SECRET_KEY) return res.status(500).json({ error: "Stripe not configured" });
 
-  if (!Number.isFinite(dollars) || dollars <= 0) {
-    return res.status(400).json({ error: "Invalid usd" });
-  }
+  const usd = Number(req.body?.usd || 0);
+  if (!Number.isFinite(usd) || usd <= 0) return res.status(400).json({ error: "Invalid usd" });
 
-  const lypos = Math.round(dollars * LYPOS_PER_USD);
+  const lypos = Math.round(usd * LYPOS_PER_USD);
 
   const session = await stripe.checkout.sessions.create({
     mode: "payment",
-    customer_email: email,
+    customer_email: req.userEmail,
     line_items: [
       {
         price_data: {
           currency: "usd",
-          unit_amount: Math.round(dollars * 100),
+          unit_amount: Math.round(usd * 100),
           product_data: { name: `${lypos} LYPOS` }
         },
         quantity: 1
       }
     ],
-    metadata: { email, lypos: String(lypos) },
+    metadata: { email: req.userEmail, lypos: String(lypos) },
     success_url: `${FRONTEND_URL}/?paid=1`,
     cancel_url: `${FRONTEND_URL}/?paid=0`
   });
 
-  res.json({ url: session.url });
+  res.json({ url: session.url, lypos });
 });
 
 
-/* ---------------------------
-   CORS (demo-friendly)
----------------------------- */
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
 
-
-/* ---------------------------
-   Stripe webhook (RAW body)
----------------------------- */
-app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), (req, res) => {
-  const sig = req.headers["stripe-signature"];
-  let event;
-
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET || "");
-  } catch (err) {
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-
-  if (event.type === "checkout.session.completed") {
-    const session = event.data.object;
-    const userId = session.metadata?.userId;
-    const lypos = Number(session.metadata?.lypos || 0);
-    if (userId && lypos > 0) {
-      const next = addCredits(userId, lypos);
-      console.log("✅ LYPOS credited:", { userId, lypos, balance: next });
-    }
-  }
-
-  res.json({ received: true });
-});
-
-// JSON body parsing (safe for non-multipart routes)
-app.use(express.json({ limit: '1mb' }));
 
 /* ---------------------------
    ENV
@@ -268,11 +206,6 @@ const {
   S3_BUCKET,
   PUBLIC_BASE_URL
 } = process.env;
-
-/* ---------------------------
-   Stripe
----------------------------- */
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", { apiVersion: "2024-06-20" });
 
 function requireEnv(name, value) {
   if (!value) {
@@ -331,77 +264,54 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/api/languages", (_req, res) => {
   res.json({
     languages: [
-      "English","Spanish","French","German","Italian","Portuguese",
-      "Dutch","Swedish","Norwegian","Danish","Finnish",
-      "Polish","Czech","Slovak","Hungarian","Romanian",
-      "Greek","Turkish","Ukrainian","Russian",
-      "Arabic","Hebrew",
-      "Hindi","Bengali","Urdu",
-      "Chinese","Japanese","Korean","Vietnamese","Thai","Indonesian"
+      "Arabic",
+      "Arabic (Egypt)",
+      "Arabic (Saudi Arabia)",
+      "Bulgarian",
+      "Chinese",
+      "Chinese (Mandarin, Simplified)",
+      "Chinese (Taiwanese Mandarin, Traditional)",
+      "Croatian",
+      "Czech",
+      "Danish (Denmark)",
+      "Dutch (Netherlands)",
+      "English",
+      "English (Australia)",
+      "English (Canada)",
+      "English (India)",
+      "English (UK)",
+      "English (United States)",
+      "Filipino (Philippines)",
+      "Finnish (Finland)",
+      "French (Canada)",
+      "French (France)",
+      "German (Austria)",
+      "German (Germany)",
+      "German (Switzerland)",
+      "Greek (Greece)",
+      "Hindi (India)",
+      "Indonesian (Indonesia)",
+      "Italian (Italy)",
+      "Japanese (Japan)",
+      "Korean (Korea)",
+      "Malay (Malaysia)",
+      "Mandarin",
+      "Polish (Poland)",
+      "Portuguese (Brazil)",
+      "Portuguese (Portugal)",
+      "Romanian (Romania)",
+      "Russian (Russia)",
+      "Slovak (Slovakia)",
+      "Spanish (Mexico)",
+      "Spanish (Spain)",
+      "Swedish (Sweden)",
+      "Tamil (India)",
+      "Turkish (T\u00fcrkiye)",
+      "Ukrainian (Ukraine)",
+      "Vietnamese (Vietnam)",
+      "Thai (Thailand)"
     ]
   });
-
-/* ---------------------------
-   Credits API (LYPOS)
----------------------------- */
-app.get("/api/credits", (req, res) => {
-  const userId = req.query.userId;
-  res.json({ balance: getBalance(userId) });
-});
-
-app.post("/api/credits/charge", (req, res, next) => {
-  try {
-    const { userId, seconds } = req.body || {};
-    if (!userId) return res.status(400).json({ error: "Missing userId" });
-
-/* ---------------------------
-   Stripe: create checkout (buy LYPOS)
-   POST { userId, usd }
----------------------------- */
-app.post("/api/stripe/create-checkout", async (req, res, next) => {
-  try {
-    const { userId, usd } = req.body || {};
-    if (!userId) return res.status(400).json({ error: "Missing userId" });
-
-    const dollars = Number(usd || 0);
-    if (!Number.isFinite(dollars) || dollars <= 0) return res.status(400).json({ error: "Invalid usd" });
-
-    const lypos = Math.round(dollars * LYPOS_PER_USD);
-
-    const session = await stripe.checkout.sessions.create({
-      mode: "payment",
-      line_items: [
-        {
-          price_data: {
-            currency: "usd",
-            unit_amount: Math.round(dollars * 100),
-            product_data: { name: `${lypos} LYPOS` }
-          },
-          quantity: 1
-        }
-      ],
-      metadata: { userId: String(userId), lypos: String(lypos) },
-      success_url: `${process.env.FRONTEND_URL || "http://localhost:3000"}/?paid=1`,
-      cancel_url: `${process.env.FRONTEND_URL || "http://localhost:3000"}/?paid=0`
-    });
-
-    res.json({ url: session.url });
-  } catch (e) { next(e); }
-});
-
-
-    const s = Number(seconds || 0);
-    const units = Math.max(1, Math.ceil(s / 30));
-    const cost = units * PRICE_PER_30S_LYPOS;
-
-    const remaining = chargeCredits(userId, cost);
-    res.json({ charged: cost, remaining });
-  } catch (e) {
-    if (e?.statusCode === 402) return res.status(402).json({ error: "INSUFFICIENT_LYPOS", ...(e.meta || {}) });
-    next(e);
-  }
-});
-
 });
 
 /**
@@ -546,12 +456,3 @@ app.get("/api/dub/:id", async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`LYPO backend running on ${port}`));
-
-
-/* ---------------------------
-   Error handler
----------------------------- */
-app.use((err, req, res, next) => {
-  console.error("❌ Error:", err?.message || err);
-  res.status(err.statusCode || 500).json({ error: err?.message || "Server error" });
-});
