@@ -63,6 +63,31 @@ async function initDb() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS payments (
+      id BIGSERIAL PRIMARY KEY,
+      email TEXT NOT NULL,
+      stripe_session_id TEXT UNIQUE,
+      amount_usd NUMERIC NOT NULL DEFAULT 0,
+      lypos INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'completed',
+      invoice_url TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS videos (
+      id BIGSERIAL PRIMARY KEY,
+      email TEXT NOT NULL,
+      prediction_id TEXT UNIQUE,
+      status TEXT NOT NULL DEFAULT 'starting',
+      input_url TEXT,
+      output_url TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+}
 }
 
 function normEmail(email) {
@@ -91,6 +116,33 @@ async function createUser(email, passwordHash) {
   );
   return rows[0];
 }
+
+async function recordPayment({ email, stripeSessionId, amountUsd, lypos, status, invoiceUrl }) {
+  const e = normEmail(email);
+  await pool.query(
+    `INSERT INTO payments (email, stripe_session_id, amount_usd, lypos, status, invoice_url)
+     VALUES ($1,$2,$3,$4,$5,$6)
+     ON CONFLICT (stripe_session_id) DO UPDATE SET
+       status=EXCLUDED.status,
+       invoice_url=COALESCE(EXCLUDED.invoice_url, payments.invoice_url)`,
+    [e, stripeSessionId || null, Number(amountUsd||0), Math.trunc(lypos||0), status || "completed", invoiceUrl || null]
+  );
+}
+
+async function upsertVideo({ email, predictionId, status, inputUrl, outputUrl }) {
+  const e = normEmail(email);
+  await pool.query(
+    `INSERT INTO videos (email, prediction_id, status, input_url, output_url)
+     VALUES ($1,$2,$3,$4,$5)
+     ON CONFLICT (prediction_id) DO UPDATE SET
+       status=EXCLUDED.status,
+       input_url=COALESCE(EXCLUDED.input_url, videos.input_url),
+       output_url=COALESCE(EXCLUDED.output_url, videos.output_url),
+       updated_at=now()`,
+    [e, predictionId || null, status || "starting", inputUrl || null, outputUrl || null]
+  );
+}
+
 async function addBalance(email, lypos) {
   const e = normEmail(email);
   await pool.query("UPDATE users SET balance = balance + $2 WHERE email=$1", [
@@ -158,11 +210,15 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
     const session = event.data.object;
     const email = session.metadata?.email;
     const lypos = Number(session.metadata?.lypos || 0);
+    const amountTotal = Number(session.amount_total || 0) / 100;
+    const sessionId = session.id;
+    const invoiceUrl = session.invoice ? String(session.invoice) : null;
 
     if (email && lypos > 0) {
       try {
+        await recordPayment({ email, stripeSessionId: sessionId, amountUsd: amountTotal, lypos, status: "completed", invoiceUrl });
         await addBalance(email, lypos);
-        console.log("✅ Credited LYPOS:", { email, lypos });
+        console.log("✅ Payment stored + credited LYPOS:", { email, lypos, amountTotal });
       } catch (e) {
         console.log("⚠️ Webhook credit failed:", e?.message || e);
       }
@@ -233,6 +289,27 @@ app.post("/api/credits/charge", auth, async (req, res) => {
   res.json({ charged: cost, remaining: result.balance });
 });
 
+
+// ---- Account dashboard
+app.get("/api/account/payments", auth, async (req, res) => {
+  const email = normEmail(req.user.email);
+  const { rows } = await pool.query(
+    "SELECT stripe_session_id, amount_usd, lypos, status, invoice_url, created_at FROM payments WHERE email=$1 ORDER BY created_at DESC LIMIT 100",
+    [email]
+  );
+  res.json({ payments: rows });
+});
+
+app.get("/api/account/videos", auth, async (req, res) => {
+  const email = normEmail(req.user.email);
+  const { rows } = await pool.query(
+    "SELECT prediction_id, status, input_url, output_url, created_at FROM videos WHERE email=$1 ORDER BY created_at DESC LIMIT 100",
+    [email]
+  );
+  res.json({ videos: rows });
+});
+
+
 // ---- Stripe checkout: buy LYPOS
 app.post("/api/stripe/create-checkout-session", auth, async (req, res) => {
   const usd = Number(req.body?.usd || 0);
@@ -255,8 +332,8 @@ app.post("/api/stripe/create-checkout-session", auth, async (req, res) => {
       }
     ],
     metadata: { email, lypos: String(lypos) },
-    success_url: `${FRONTEND_URL}/?paid=1`,
-    cancel_url: `${FRONTEND_URL}/?paid=0`
+    success_url: `${FRONTEND_URL}/dashboard.html?paid=1`,
+    cancel_url: `${FRONTEND_URL}/dashboard.html?paid=0`
   });
 
   res.json({ url: session.url });
@@ -421,6 +498,7 @@ app.post("/api/dub-upload", auth, (req, res) => {
         const videoUrl = `${base}/${key}`;
 
         const prediction = await createHeygenPrediction({ videoUrl, outputLanguage });
+        await upsertVideo({ email, predictionId: prediction.id, status: prediction.status, inputUrl: videoUrl });
 
         res.json({
           id: prediction.id,
@@ -467,6 +545,12 @@ app.get("/api/dub/:id", auth, async (req, res) => {
         out.output ||
         Object.values(out).find((x) => typeof x === "string") ||
         null;
+    }
+
+    try {
+      await upsertVideo({ email: req.user.email, predictionId: predictionId, status: prediction.status, outputUrl });
+    } catch (e) {
+      console.log("video upsert failed", e?.message || e);
     }
 
     res.json({
