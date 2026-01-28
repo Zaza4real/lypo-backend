@@ -12,11 +12,7 @@
     "@aws-sdk/client-s3": "^3.637.0",
     "busboy": "^1.6.0",
     "express": "^4.19.2",
-    "replicate": "^0.18.1",
-    "stripe": "^16.9.0",
-    "jsonwebtoken": "^9.0.2",
-    "bcryptjs": "^2.4.3",
-    "pg": "^8.11.5"
+    "replicate": "^0.18.1"
   },
   "description": "",
   "main": "index.js",
