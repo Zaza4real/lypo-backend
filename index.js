@@ -476,9 +476,9 @@ app.post("/api/dub-upload", auth, (req, res) => {
         if (!outputLanguage) return res.status(400).json({ error: "Missing output_language" });
 
         // Charge credits server-side (authoritative)
-        const seconds = Math.max(1, Number(secondsField || 0));
-        const units = Math.max(1, Math.ceil(seconds / 30));
-        const cost = units * PRICE_PER_30S_LYPOS;
+        // Bill per-second to match the frontend estimate (e.g. 10s => 100 credits when CREDITS_PER_SECOND=10)
+        const seconds = Math.max(1, Math.ceil(Number(secondsField || 0)));
+        const cost = seconds * CREDITS_PER_SECOND;
 
         const email = req.user.email;
         const charge = await chargeBalance(email, cost);
@@ -511,7 +511,9 @@ app.post("/api/dub-upload", auth, (req, res) => {
           id: prediction.id,
           predictionId: prediction.id,
           status: prediction.status,
-          uploadedUrl: videoUrl
+          uploadedUrl: videoUrl,
+          chargedCredits: cost,
+          remainingCredits: charge.balance
         });
       } catch (e) {
         console.error(e);
