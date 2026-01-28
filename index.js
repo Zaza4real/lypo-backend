@@ -51,7 +51,7 @@ const { Pool } = pg;
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   // Render Postgres usually requires SSL in production
-  ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false
+  ssl: process.env.DISABLE_PG_SSL === "1" ? false : { rejectUnauthorized: false }
 });
 
 async function initDb() {
