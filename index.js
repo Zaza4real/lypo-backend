@@ -909,6 +909,27 @@ app.get("/api/admin/blog/posts", auth, requireAdmin, async (req, res) => {
   }
 });
 
+
+app.get("/api/admin/blog/posts/:id", auth, requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!id) return res.status(400).json({ error: "Bad id" });
+    const { rows } = await pool.query(
+      `SELECT id, slug, title, excerpt, content_html, cover_url, video_url, status, published_at, created_at, updated_at
+       FROM blog_posts
+       WHERE id=$1
+       LIMIT 1`,
+      [id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: "Not found" });
+    res.json({ post: rows[0] });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Could not load post" });
+  }
+});
+
+
 app.post("/api/admin/blog/posts", auth, requireAdmin, async (req, res) => {
   try {
     const { slug, title, excerpt, content_html, cover_url, video_url, status } = req.body || {};
