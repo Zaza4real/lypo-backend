@@ -183,15 +183,43 @@ async function createUser(email, passwordHash) {
 
 async function recordPayment({ email, stripeSessionId, amountUsd, lypos, status, invoiceUrl }) {
   const e = normEmail(email);
-  await pool.query(
-    `INSERT INTO payments (email, stripe_session_id, amount_usd, lypos, status, invoice_url)
-     VALUES ($1,$2,$3,$4,$5,$6)
-     ON CONFLICT (stripe_session_id) DO UPDATE SET
-       status=EXCLUDED.status,
-       invoice_url=COALESCE(EXCLUDED.invoice_url, payments.invoice_url)`,
-    [e, stripeSessionId || null, Number(amountUsd||0), Math.trunc(lypos||0), status || "completed", invoiceUrl || null]
-  );
+  const sid = stripeSessionId || null;
+  if (!sid) throw new Error("Missing stripeSessionId");
+
+  // Idempotent write without requiring a UNIQUE constraint (Render DB schema may differ).
+  // Strategy: try UPDATE first; if nothing updated, INSERT if not exists.
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const upd = await client.query(
+      `UPDATE payments
+         SET status=$1,
+             invoice_url=COALESCE($2, invoice_url),
+             amount_usd=COALESCE(NULLIF($3,0), amount_usd),
+             lypos=COALESCE(NULLIF($4,0), lypos)
+       WHERE stripe_session_id=$5 AND email=$6`,
+      [status || "completed", invoiceUrl || null, Number(amountUsd || 0), Math.trunc(lypos || 0), sid, e]
+    );
+
+    if (upd.rowCount === 0) {
+      await client.query(
+        `INSERT INTO payments (email, stripe_session_id, amount_usd, lypos, status, invoice_url)
+         SELECT $1,$2,$3,$4,$5,$6
+         WHERE NOT EXISTS (SELECT 1 FROM payments WHERE stripe_session_id=$2 AND email=$1)`,
+        [e, sid, Number(amountUsd || 0), Math.trunc(lypos || 0), status || "completed", invoiceUrl || null]
+      );
+    }
+
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 }
+
 
 async function upsertVideo({ email, predictionId, status, inputUrl, outputUrl }) {
   const e = normEmail(email);
