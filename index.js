@@ -15,8 +15,8 @@ const app = express();
    CORS
 ---------------------------- */
 const allowedOrigins = new Set([
-  "https://lypo.org",
-  "https://www.lypo.org",
+  "https://digitalgeekworld.com",
+  "https://www.digitalgeekworld.com",
   "https://homepage-3d78.onrender.com",
   process.env.FRONTEND_URL || ""
 ].filter(Boolean));
@@ -48,9 +48,56 @@ const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
 const JWT_SECRET = process.env.JWT_SECRET || "dev_change_me";
 
-// ---- Resend (HTTP email, no SMTP)
-const resend = new Resend(process.env.RESEND_API_KEY || "");
+// ---- Resend (Support emails)
+let resend = null;
+if (process.env.RESEND_API_KEY) {
+  try {
+    resend = new Resend(process.env.RESEND_API_KEY);
+  } catch (e) {
+    console.error("Resend init failed:", e?.message || e);
+  }
+}
 const EMAIL_FROM = process.env.EMAIL_FROM || "LYPO <no-reply@lypo.org>";
+const SUPPORT_TO = process.env.SUPPORT_TO || process.env.SUPPORT_EMAIL || process.env.ADMIN_EMAIL || "";
+
+async function sendSupportEmail({ fromEmail, subject, message, authedEmail }) {
+  const to = SUPPORT_TO;
+  const safeSubject = (subject && String(subject).trim()) ? String(subject).trim() : "New support request";
+  const body = String(message || "").trim();
+  const fromLine = fromEmail ? String(fromEmail).trim() : "(not provided)";
+  const authedLine = authedEmail ? String(authedEmail).trim() : "";
+  const html = `
+    <p><strong>Support request</strong></p>
+    <p><strong>From:</strong> ${fromLine}${authedLine ? ` (logged in as ${authedLine})` : ""}</p>
+    <p><strong>Subject:</strong> ${safeSubject}</p>
+    <p><strong>Message:</strong></p>
+    <pre style="white-space:pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;">${body.replace(/</g,"&lt;").replace(/>/g,"&gt;")}</pre>
+  `;
+
+  if (!to) {
+    console.log("⚠️ SUPPORT_TO not configured. Support message:", { fromEmail, safeSubject, body });
+    return { ok: false, reason: "SUPPORT_TO_NOT_SET" };
+  }
+
+  if (!resend) {
+    console.log("⚠️ RESEND_API_KEY not configured. Support message:", { to, fromEmail, safeSubject, body });
+    return { ok: false, reason: "RESEND_NOT_CONFIGURED" };
+  }
+
+  const { data, error } = await resend.emails.send({
+    from: EMAIL_FROM,
+    to: [to],
+    replyTo: fromEmail || undefined,
+    subject: `[LYPO Support] ${safeSubject}`,
+    html
+  });
+
+  if (error) {
+    console.error("❌ Resend support email error:", error);
+    return { ok: false, reason: "SEND_FAILED", error };
+  }
+  return { ok: true, id: data?.id || null };
+}
 
 // ---- Postgres
 const { Pool } = pg;
@@ -69,19 +116,6 @@ async function initDb() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS password_resets (
-      id BIGSERIAL PRIMARY KEY,
-      email TEXT NOT NULL,
-      token_hash TEXT NOT NULL,
-      expires_at TIMESTAMPTZ NOT NULL,
-      used_at TIMESTAMPTZ,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-  `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS password_resets_email_idx ON password_resets(email);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS password_resets_token_hash_idx ON password_resets(token_hash);`);
-
   await pool.query(`
     CREATE TABLE IF NOT EXISTS payments (
       id BIGSERIAL PRIMARY KEY,
@@ -123,40 +157,6 @@ function publicUserRow(r) {
 }
 function signToken(email) {
   return jwt.sign({ email }, JWT_SECRET, { expiresIn: "30d" });
-}
-
-function sha256Hex(s) {
-  return crypto.createHash("sha256").update(String(s)).digest("hex");
-}
-function normalizeBaseUrl(u) {
-  const raw = String(u || "").trim();
-  if (!raw) return "";
-  if (/^https?:\/\//i.test(raw)) return raw.replace(/\/$/, "");
-  return `https://${raw}`.replace(/\/$/, "");
-}
-
-async function sendPasswordResetEmail(toEmail, resetUrl) {
-  if (!process.env.RESEND_API_KEY) {
-    console.log("🔑 Password reset link (RESEND_API_KEY missing):", resetUrl);
-    return;
-  }
-  try {
-    await resend.emails.send({
-      from: EMAIL_FROM,
-      to: toEmail,
-      subject: "Reset your LYPO password",
-      html: `
-        <p>We received a request to reset your password.</p>
-        <p><a href="${resetUrl}">Reset password</a></p>
-        <p>This link expires in 60 minutes.</p>
-        <p>If you didn’t request this, you can ignore this email.</p>
-      `
-    });
-    console.log("✅ Password reset email sent to:", toEmail);
-  } catch (err) {
-    console.error("❌ Resend send failed:", err?.message || err);
-    console.log("🔑 Password reset link (email failed):", resetUrl);
-  }
 }
 
 async function getUserByEmail(email) {
@@ -308,6 +308,44 @@ try {
 // JSON for normal routes
 app.use(express.json({ limit: "2mb" }));
 
+// ---- Support (send message via Resend)
+app.post("/api/support", async (req, res) => {
+  const fromEmail = String(req.body?.email || "").trim();
+  const subject = String(req.body?.subject || "").trim();
+  const message = String(req.body?.message || "").trim();
+
+  if (!message) return res.status(400).json({ error: "Missing message" });
+
+  // Optional: if user is logged in, capture their email from Bearer token
+  let authedEmail = "";
+  try {
+    const h = req.headers.authorization || "";
+    const token = h.startsWith("Bearer ") ? h.slice(7) : "";
+    if (token) {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      authedEmail = decoded?.email || "";
+    }
+  } catch {
+    // ignore invalid tokens
+  }
+
+  // Require at least one email source: provided email OR logged-in email
+  if (!fromEmail && !authedEmail) return res.status(400).json({ error: "Missing email" });
+
+  try {
+    const out = await sendSupportEmail({ fromEmail: fromEmail || authedEmail, subject, message, authedEmail });
+    // Always return ok to the client (avoid leaking config), but log reasons
+    if (!out.ok) {
+      console.log("Support email not sent:", out.reason);
+    }
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("Support endpoint error:", e?.message || e);
+    return res.json({ ok: true });
+  }
+});
+
+
 // ---- Auth routes
 app.post("/api/auth/signup", async (req, res) => {
   const { email, password } = req.body || {};
@@ -343,66 +381,6 @@ app.get("/api/auth/me", auth, async (req, res) => {
   if (!u) return res.status(401).json({ error: "Invalid user" });
   res.json({ user: publicUserRow(u) });
 });
-
-// ---- Forgot password (Resend HTTP email; no SMTP)
-// Always returns {ok:true} to avoid leaking whether an email exists.
-async function handleForgotPassword(req, res) {
-  const email = normEmail(req.body?.email || "");
-  try {
-    if (email) {
-      const u = await getUserByEmail(email);
-      if (u) {
-        const token = crypto.randomBytes(32).toString("hex");
-        const tokenHash = sha256Hex(token);
-        const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 60 minutes
-
-        await pool.query(
-          "INSERT INTO password_resets (email, token_hash, expires_at) VALUES ($1,$2,$3)",
-          [email, tokenHash, expiresAt]
-        );
-
-        const base = normalizeBaseUrl(process.env.APP_URL || process.env.FRONTEND_URL || FRONTEND_URL);
-        const resetUrl = `${base}/auth.html#reset=${encodeURIComponent(token)}&email=${encodeURIComponent(email)}`;
-
-        await sendPasswordResetEmail(email, resetUrl);
-      }
-    }
-  } catch (err) {
-    console.error("forgot-password error:", err?.message || err);
-  }
-  return res.json({ ok: true });
-}
-
-async function handleResetPassword(req, res) {
-  const email = normEmail(req.body?.email || "");
-  const token = String(req.body?.token || "");
-  const newPassword = String(req.body?.newPassword || "");
-
-  if (!email || !token || !newPassword) return res.status(400).json({ error: "Missing email/token/newPassword" });
-  if (newPassword.length < 6) return res.status(400).json({ error: "Password too short (min 6)" });
-
-  const tokenHash = sha256Hex(token);
-
-  const r = await pool.query(
-    "SELECT id, expires_at, used_at FROM password_resets WHERE email=$1 AND token_hash=$2 ORDER BY created_at DESC LIMIT 1",
-    [email, tokenHash]
-  );
-  const row = r.rows?.[0];
-  if (!row || row.used_at) return res.status(400).json({ error: "Invalid or expired reset link" });
-  if (Date.now() > new Date(row.expires_at).getTime()) return res.status(400).json({ error: "Invalid or expired reset link" });
-
-  const passwordHash = await bcrypt.hash(newPassword, 10);
-  await pool.query("UPDATE users SET password_hash=$1 WHERE email=$2", [passwordHash, email]);
-  await pool.query("UPDATE password_resets SET used_at=now() WHERE id=$1", [row.id]);
-
-  return res.json({ ok: true });
-}
-
-app.post("/api/auth/forgot-password", handleForgotPassword);
-app.post("/api/auth/reset-password", handleResetPassword);
-app.post("/api/auth/forgot", handleForgotPassword);
-app.post("/api/auth/reset", handleResetPassword);
-
 
 // ---- Credits
 
