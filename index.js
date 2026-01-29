@@ -220,6 +220,35 @@ async function createUser(email, passwordHash) {
   return rows[0];
 }
 
+
+async function resolveInvoiceUrlFromSession(session) {
+  let invoiceUrl = null;
+  try {
+    // For one-time payments, Stripe may not create an invoice.
+    if (session?.invoice) {
+      const inv = await stripe.invoices.retrieve(String(session.invoice));
+      invoiceUrl = inv.invoice_pdf || inv.hosted_invoice_url || null;
+    } else if (session?.payment_intent) {
+      const piId = typeof session.payment_intent === "string" ? session.payment_intent : session.payment_intent.id;
+      const pi = await stripe.paymentIntents.retrieve(String(piId), { expand: ["charges"] });
+      const charge = pi?.charges?.data?.[0];
+      invoiceUrl = charge?.receipt_url || null;
+    }
+  } catch {
+    invoiceUrl = null;
+  }
+  return invoiceUrl;
+}
+
+async function resolveInvoiceUrlBySessionId(sessionId) {
+  try {
+    const session = await stripe.checkout.sessions.retrieve(String(sessionId), { expand: ["payment_intent"] });
+    return await resolveInvoiceUrlFromSession(session);
+  } catch {
+    return null;
+  }
+}
+
 async function recordPayment({ email, stripeSessionId, amountUsd, lypos, status, invoiceUrl }) {
   const e = normEmail(email);
   await pool.query(
@@ -504,8 +533,27 @@ app.get("/api/account/payments", auth, async (req, res) => {
     "SELECT stripe_session_id, amount_usd, lypos, status, invoice_url, created_at FROM payments WHERE email=$1 ORDER BY created_at DESC LIMIT 100",
     [email]
   );
+
+  // Backfill missing invoice/receipt URLs (helps when webhooks aren't configured or invoices are created later)
+  try {
+    const missing = rows.filter(r => r.stripe_session_id && !r.invoice_url).slice(0, 5);
+    for (const p of missing) {
+      const url = await resolveInvoiceUrlBySessionId(p.stripe_session_id);
+      if (url) {
+        await pool.query(
+          "UPDATE payments SET invoice_url=$1 WHERE stripe_session_id=$2",
+          [url, p.stripe_session_id]
+        );
+        p.invoice_url = url;
+      }
+    }
+  } catch (e) {
+    // ignore backfill errors; still return payments list
+  }
+
   res.json({ payments: rows });
 });
+
 
 app.get("/api/account/videos", auth, async (req, res) => {
   const email = normEmail(req.user.email);
