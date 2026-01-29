@@ -7,6 +7,7 @@ import Stripe from "stripe";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import pg from "pg";
+import { Resend } from "resend";
 
 const app = express();
 
@@ -14,17 +15,34 @@ const app = express();
    CORS
 ---------------------------- */
 const allowedOrigins = new Set([
+  // Production
+  "https://lypo.org",
+  "https://www.lypo.org",
+
+  // Legacy / misc
   "https://digitalgeekworld.com",
   "https://www.digitalgeekworld.com",
+
+  // Render preview
   "https://homepage-3d78.onrender.com",
-  process.env.FRONTEND_URL || ""
+
+  // Config-driven
+  process.env.FRONTEND_URL || "",
+  ...(process.env.CORS_EXTRA_ORIGINS ? process.env.CORS_EXTRA_ORIGINS.split(",").map(s => s.trim()) : [])
 ].filter(Boolean));
 
 const CORS_ALLOW_ALL = process.env.CORS_ALLOW_ALL === "1";
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (origin && (CORS_ALLOW_ALL || allowedOrigins.has(origin))) {
+  if (origin && (
+    CORS_ALLOW_ALL ||
+    allowedOrigins.has(origin) ||
+    // Allow Render subdomains (preview/production) without needing to enumerate each one
+    /\.onrender\.com$/.test(origin) ||
+    // Local dev
+    /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)
+  )) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
   res.setHeader("Vary", "Origin");
@@ -46,6 +64,57 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "");
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
 const JWT_SECRET = process.env.JWT_SECRET || "dev_change_me";
+
+// ---- Resend (Support emails)
+let resend = null;
+if (process.env.RESEND_API_KEY) {
+  try {
+    resend = new Resend(process.env.RESEND_API_KEY);
+  } catch (e) {
+    console.error("Resend init failed:", e?.message || e);
+  }
+}
+const EMAIL_FROM = process.env.EMAIL_FROM || "LYPO <no-reply@lypo.org>";
+const SUPPORT_TO = process.env.SUPPORT_TO || process.env.SUPPORT_EMAIL || process.env.ADMIN_EMAIL || "";
+
+async function sendSupportEmail({ fromEmail, subject, message, authedEmail }) {
+  const to = SUPPORT_TO;
+  const safeSubject = (subject && String(subject).trim()) ? String(subject).trim() : "New support request";
+  const body = String(message || "").trim();
+  const fromLine = fromEmail ? String(fromEmail).trim() : "(not provided)";
+  const authedLine = authedEmail ? String(authedEmail).trim() : "";
+  const html = `
+    <p><strong>Support request</strong></p>
+    <p><strong>From:</strong> ${fromLine}${authedLine ? ` (logged in as ${authedLine})` : ""}</p>
+    <p><strong>Subject:</strong> ${safeSubject}</p>
+    <p><strong>Message:</strong></p>
+    <pre style="white-space:pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;">${body.replace(/</g,"&lt;").replace(/>/g,"&gt;")}</pre>
+  `;
+
+  if (!to) {
+    console.log("⚠️ SUPPORT_TO not configured. Support message:", { fromEmail, safeSubject, body });
+    return { ok: false, reason: "SUPPORT_TO_NOT_SET" };
+  }
+
+  if (!resend) {
+    console.log("⚠️ RESEND_API_KEY not configured. Support message:", { to, fromEmail, safeSubject, body });
+    return { ok: false, reason: "RESEND_NOT_CONFIGURED" };
+  }
+
+  const { data, error } = await resend.emails.send({
+    from: EMAIL_FROM,
+    to: [to],
+    replyTo: fromEmail || undefined,
+    subject: `[LYPO Support] ${safeSubject}`,
+    html
+  });
+
+  if (error) {
+    console.error("❌ Resend support email error:", error);
+    return { ok: false, reason: "SEND_FAILED", error };
+  }
+  return { ok: true, id: data?.id || null };
+}
 
 // ---- Postgres
 const { Pool } = pg;
@@ -255,6 +324,44 @@ try {
 
 // JSON for normal routes
 app.use(express.json({ limit: "2mb" }));
+
+// ---- Support (send message via Resend)
+app.post("/api/support", async (req, res) => {
+  const fromEmail = String(req.body?.email || "").trim();
+  const subject = String(req.body?.subject || "").trim();
+  const message = String(req.body?.message || "").trim();
+
+  if (!message) return res.status(400).json({ error: "Missing message" });
+
+  // Optional: if user is logged in, capture their email from Bearer token
+  let authedEmail = "";
+  try {
+    const h = req.headers.authorization || "";
+    const token = h.startsWith("Bearer ") ? h.slice(7) : "";
+    if (token) {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      authedEmail = decoded?.email || "";
+    }
+  } catch {
+    // ignore invalid tokens
+  }
+
+  // Require at least one email source: provided email OR logged-in email
+  if (!fromEmail && !authedEmail) return res.status(400).json({ error: "Missing email" });
+
+  try {
+    const out = await sendSupportEmail({ fromEmail: fromEmail || authedEmail, subject, message, authedEmail });
+    // Always return ok to the client (avoid leaking config), but log reasons
+    if (!out.ok) {
+      console.log("Support email not sent:", out.reason);
+    }
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("Support endpoint error:", e?.message || e);
+    return res.json({ ok: true });
+  }
+});
+
 
 // ---- Auth routes
 app.post("/api/auth/signup", async (req, res) => {
