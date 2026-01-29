@@ -15,34 +15,17 @@ const app = express();
    CORS
 ---------------------------- */
 const allowedOrigins = new Set([
-  // Production
-  "https://lypo.org",
-  "https://www.lypo.org",
-
-  // Legacy / misc
   "https://digitalgeekworld.com",
   "https://www.digitalgeekworld.com",
-
-  // Render preview
   "https://homepage-3d78.onrender.com",
-
-  // Config-driven
-  process.env.FRONTEND_URL || "",
-  ...(process.env.CORS_EXTRA_ORIGINS ? process.env.CORS_EXTRA_ORIGINS.split(",").map(s => s.trim()) : [])
+  process.env.FRONTEND_URL || ""
 ].filter(Boolean));
 
 const CORS_ALLOW_ALL = process.env.CORS_ALLOW_ALL === "1";
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (origin && (
-    CORS_ALLOW_ALL ||
-    allowedOrigins.has(origin) ||
-    // Allow Render subdomains (preview/production) without needing to enumerate each one
-    /\.onrender\.com$/.test(origin) ||
-    // Local dev
-    /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)
-  )) {
+  if (origin && (CORS_ALLOW_ALL || allowedOrigins.has(origin))) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
   res.setHeader("Vary", "Origin");
@@ -300,8 +283,8 @@ try {
     // Prefer a directly downloadable PDF when available.
     invoiceUrl = inv.invoice_pdf || inv.hosted_invoice_url || null;
   } else if (session.payment_intent) {
-    const pi = await stripe.paymentIntents.retrieve(String(session.payment_intent), { expand: ["charges"] });
-    const charge = pi?.charges?.data?.[0];
+    const pi = await stripe.paymentIntents.retrieve(String(session.payment_intent), { expand: ["latest_charge"] });
+    const charge = pi?.latest_charge;
     invoiceUrl = charge?.receipt_url || null;
   }
 } catch (e) {
@@ -464,7 +447,17 @@ app.get("/api/account/payments", auth, async (req, res) => {
     "SELECT stripe_session_id, amount_usd, lypos, status, invoice_url, created_at FROM payments WHERE email=$1 ORDER BY created_at DESC LIMIT 100",
     [email]
   );
-  res.json({ payments: rows });
+
+  // Normalize for frontend compatibility (camelCase + safe ISO date), while keeping original fields.
+  const payments = rows.map((r) => ({
+    ...r,
+    stripeSessionId: r.stripe_session_id,
+    amountUsd: r.amount_usd,
+    invoiceUrl: r.invoice_url,
+    createdAt: r.created_at ? new Date(r.created_at).toISOString() : null
+  }));
+
+  res.json({ payments });
 });
 
 app.get("/api/account/videos", auth, async (req, res) => {
@@ -513,7 +506,7 @@ app.get("/api/stripe/confirm", auth, async (req, res) => {
   if (!sessionId) return res.status(400).json({ error: "Missing session_id" });
 
   // Retrieve the session from Stripe
-  const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ["payment_intent", "payment_intent.charges"] });
+  const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ["payment_intent", "payment_intent.latest_charge"] });
 
   // Must belong to the logged-in user
   const email = req.user.email;
@@ -542,7 +535,7 @@ app.get("/api/stripe/confirm", auth, async (req, res) => {
       invoiceUrl = inv.invoice_pdf || inv.hosted_invoice_url || null;
     } else {
       const pi = session.payment_intent;
-      const charge = pi?.charges?.data?.[0];
+      const charge = pi?.latest_charge;
       invoiceUrl = charge?.receipt_url || null;
     }
   } catch {
@@ -569,7 +562,7 @@ app.get("/api/stripe/confirm", auth, async (req, res) => {
   }
 
   const bal = await getBalance(email);
-  res.json({ ok: true, balance: bal, invoice_url: invoiceUrl });
+  res.json({ ok: true, balance: bal, invoice_url: invoiceUrl, invoiceUrl });
 });
 
 /* ---------------------------
