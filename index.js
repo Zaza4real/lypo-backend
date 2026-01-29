@@ -150,22 +150,6 @@ async function upsertVideo({ email, predictionId, status, inputUrl, outputUrl })
   );
 }
 
-async function updatePaymentInvoice(email, stripeSessionId, invoiceUrl) {
-  if (!invoiceUrl) return;
-  try {
-    await pool.query(
-      `UPDATE payments
-         SET invoice_url = $1
-       WHERE email = $2
-         AND stripe_session_id = $3
-         AND (invoice_url IS NULL OR invoice_url = '' OR invoice_url ~ '^in_[A-Za-z0-9]+')`,
-      [invoiceUrl, normEmail(email), stripeSessionId]
-    );
-  } catch (e) {
-    // non-fatal
-  }
-}
-
 async function addBalance(email, delta, reason) {
   const e = normEmail(email);
   const d = Math.trunc(Number(delta || 0));
@@ -476,8 +460,6 @@ app.get("/api/stripe/confirm", auth, async (req, res) => {
       console.log("⚠️ confirm payment failed:", msg);
     }
   }
-
-  await updatePaymentInvoice(email, session.id, invoiceUrl);
 
   const bal = await getBalance(email);
   res.json({ ok: true, balance: bal, invoice_url: invoiceUrl });
