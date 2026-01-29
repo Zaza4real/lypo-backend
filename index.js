@@ -18,6 +18,8 @@ const allowedOrigins = new Set([
   "https://digitalgeekworld.com",
   "https://www.digitalgeekworld.com",
   "https://homepage-3d78.onrender.com",
+  "https://lypo.org",
+  "https://www.lypo.org",
   process.env.FRONTEND_URL || ""
 ].filter(Boolean));
 
@@ -34,6 +36,9 @@ app.use((req, res, next) => {
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
+
+// Async route wrapper to prevent unhandled promise rejections (which can crash the server)
+const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 /* ---------------------------
    Auth + Credits + Stripe (LYPOS)
@@ -283,8 +288,8 @@ try {
     // Prefer a directly downloadable PDF when available.
     invoiceUrl = inv.invoice_pdf || inv.hosted_invoice_url || null;
   } else if (session.payment_intent) {
-    const pi = await stripe.paymentIntents.retrieve(String(session.payment_intent), { expand: ["latest_charge"] });
-    const charge = pi?.latest_charge;
+    const pi = await stripe.paymentIntents.retrieve(String(session.payment_intent), { expand: ["charges"] });
+    const charge = pi?.charges?.data?.[0];
     invoiceUrl = charge?.receipt_url || null;
   }
 } catch (e) {
@@ -441,26 +446,16 @@ app.post("/api/credits/charge", auth, async (req, res) => {
 
 
 // ---- Account dashboard
-app.get("/api/account/payments", auth, async (req, res) => {
+app.get("/api/account/payments", auth, asyncHandler(async (req, res) => {
   const email = normEmail(req.user.email);
   const { rows } = await pool.query(
     "SELECT stripe_session_id, amount_usd, lypos, status, invoice_url, created_at FROM payments WHERE email=$1 ORDER BY created_at DESC LIMIT 100",
     [email]
   );
+  res.json({ payments: rows });
+}));
 
-  // Normalize for frontend compatibility (camelCase + safe ISO date), while keeping original fields.
-  const payments = rows.map((r) => ({
-    ...r,
-    stripeSessionId: r.stripe_session_id,
-    amountUsd: r.amount_usd,
-    invoiceUrl: r.invoice_url,
-    createdAt: r.created_at ? new Date(r.created_at).toISOString() : null
-  }));
-
-  res.json({ payments });
-});
-
-app.get("/api/account/videos", auth, async (req, res) => {
+app.get("/api/account/videos", auth, asyncHandler(async (req, res) => {
   const email = normEmail(req.user.email);
   const { rows } = await pool.query(
     "SELECT prediction_id, status, input_url, output_url, created_at FROM videos WHERE email=$1 ORDER BY created_at DESC LIMIT 100",
@@ -501,7 +496,7 @@ app.post("/api/stripe/create-checkout-session", auth, async (req, res) => {
 
 // Confirm Checkout Session on return (fallback if webhook is not configured)
 // Idempotent: will not double-credit if already recorded.
-app.get("/api/stripe/confirm", auth, async (req, res) => {
+app.get("/api/stripe/confirm", auth, asyncHandler(async (req, res) => {
   const sessionId = String(req.query?.session_id || "").trim();
   if (!sessionId) return res.status(400).json({ error: "Missing session_id" });
 
@@ -535,7 +530,10 @@ app.get("/api/stripe/confirm", auth, async (req, res) => {
       invoiceUrl = inv.invoice_pdf || inv.hosted_invoice_url || null;
     } else {
       const pi = session.payment_intent;
-      const charge = pi?.latest_charge;
+      let charge = pi?.latest_charge;
+      if (charge && typeof charge === "string") {
+        charge = await stripe.charges.retrieve(charge);
+      }
       invoiceUrl = charge?.receipt_url || null;
     }
   } catch {
@@ -563,7 +561,7 @@ app.get("/api/stripe/confirm", auth, async (req, res) => {
 
   const bal = await getBalance(email);
   res.json({ ok: true, balance: bal, invoice_url: invoiceUrl, invoiceUrl });
-});
+}));
 
 /* ---------------------------
    ENV
@@ -795,7 +793,21 @@ const PORT = process.env.PORT || 3000;
 initDb()
   .then(() => {
     console.log("✅ DB ready");
-    app.listen(PORT, () => console.log(`LYPO backend running on ${PORT}`));
+    
+// Global error handler (ensures we respond instead of crashing, which can surface as 502 + CORS errors)
+app.use((err, req, res, next) => {
+  try {
+    console.log("❌ Unhandled error:", err?.stack || err);
+    if (res.headersSent) return next(err);
+    const status = Number(err?.statusCode || err?.status || 500);
+    res.status(status).json({ error: err?.message || "Internal Server Error" });
+  } catch (e) {
+    // Last resort: avoid crashing
+    try { res.status(500).json({ error: "Internal Server Error" }); } catch {}
+  }
+});
+
+app.listen(PORT, () => console.log(`LYPO backend running on ${PORT}`));
   })
   .catch((e) => {
     console.error("❌ DB init failed", e);
