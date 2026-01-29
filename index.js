@@ -176,16 +176,20 @@ async function createUser(email, passwordHash) {
   return rows[0];
 }
 
+// Upsert a payment row and return whether it was newly inserted.
+// This lets us keep crediting idempotent (only credit on first insert).
 async function recordPayment({ email, stripeSessionId, amountUsd, lypos, status, invoiceUrl }) {
   const e = normEmail(email);
-  await pool.query(
+  const { rows } = await pool.query(
     `INSERT INTO payments (email, stripe_session_id, amount_usd, lypos, status, invoice_url)
      VALUES ($1,$2,$3,$4,$5,$6)
      ON CONFLICT (stripe_session_id) DO UPDATE SET
        status=EXCLUDED.status,
-       invoice_url=COALESCE(EXCLUDED.invoice_url, payments.invoice_url)`,
-    [e, stripeSessionId || null, Number(amountUsd||0), Math.trunc(lypos||0), status || "completed", invoiceUrl || null]
+       invoice_url=COALESCE(EXCLUDED.invoice_url, payments.invoice_url)
+     RETURNING (xmax = 0) AS inserted`,
+    [e, stripeSessionId || null, Number(amountUsd || 0), Math.trunc(lypos || 0), status || "completed", invoiceUrl || null]
   );
+  return Boolean(rows?.[0]?.inserted);
 }
 
 async function upsertVideo({ email, predictionId, status, inputUrl, outputUrl }) {
@@ -293,9 +297,15 @@ try {
 
     if (email && lypos > 0) {
       try {
-        await recordPayment({ email, stripeSessionId: sessionId, amountUsd: amountTotal, lypos, status: "completed", invoiceUrl });
-        await addBalance(email, lypos);
-        console.log("✅ Payment stored + credited LYPOS:", { email, lypos, amountTotal });
+        // IMPORTANT: only credit balance once per Stripe session.
+        // recordPayment() returns true if this is the *first* time we've seen this session.
+        const inserted = await recordPayment({ email, stripeSessionId: sessionId, amountUsd: amountTotal, lypos, status: "completed", invoiceUrl });
+        if (inserted) {
+          await addBalance(email, lypos);
+          console.log("✅ Payment stored + credited LYPOS:", { email, lypos, amountTotal });
+        } else {
+          console.log("ℹ️ Payment already recorded (no double-credit):", { email, lypos, amountTotal });
+        }
       } catch (e) {
         console.log("⚠️ Webhook credit failed:", e?.message || e);
       }
@@ -444,7 +454,17 @@ app.post("/api/credits/charge", auth, async (req, res) => {
 app.get("/api/account/payments", auth, async (req, res) => {
   const email = normEmail(req.user.email);
   const { rows } = await pool.query(
-    "SELECT stripe_session_id, amount_usd, lypos, status, invoice_url, created_at FROM payments WHERE email=$1 ORDER BY created_at DESC LIMIT 100",
+    `SELECT
+       stripe_session_id AS "stripeSessionId",
+       amount_usd        AS "amountUsd",
+       lypos,
+       status,
+       invoice_url       AS "invoiceUrl",
+       created_at        AS "createdAt"
+     FROM payments
+     WHERE email=$1
+     ORDER BY created_at DESC
+     LIMIT 100`,
     [email]
   );
   res.json({ payments: rows });
@@ -532,9 +552,9 @@ app.get("/api/stripe/confirm", auth, async (req, res) => {
     invoiceUrl = null;
   }
 
-  // Record payment + credit balance (idempotent because stripe_session_id is UNIQUE)
+  // Record payment + credit balance (idempotent: never double-credit for the same Stripe session)
   try {
-    await recordPayment({
+    const inserted = await recordPayment({
       email,
       stripeSessionId: session.id,
       amountUsd: amountTotal,
@@ -542,17 +562,15 @@ app.get("/api/stripe/confirm", auth, async (req, res) => {
       status: "completed",
       invoiceUrl
     });
-    await addBalance(email, credits);
-  } catch (e) {
-    // If already recorded, ignore; still return current balance
-    const msg = String(e?.message || "");
-    if (!msg.toLowerCase().includes("duplicate") && !msg.toLowerCase().includes("unique")) {
-      console.log("⚠️ confirm payment failed:", msg);
+    if (inserted) {
+      await addBalance(email, credits);
     }
+  } catch (e) {
+    console.log("⚠️ confirm payment failed:", e?.message || e);
   }
 
   const bal = await getBalance(email);
-  res.json({ ok: true, balance: bal, invoice_url: invoiceUrl });
+  res.json({ ok: true, balance: bal, invoiceUrl });
 });
 
 /* ---------------------------
