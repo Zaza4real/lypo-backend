@@ -12,10 +12,18 @@ import { Resend } from "resend";
 const app = express();
 
 function requireAdmin(req, res, next) {
-  if (!req.user || req.user.is_admin !== true) {
+  // Allow admin via env whitelist OR token flag OR DB flag
+  const email = req.user?.email;
+  const tokenAdmin = req.user?.is_admin === true;
+  const envAdmin = isAdminEmail(email);
+  if (envAdmin || tokenAdmin) return next();
+
+  // Fallback: check DB (helps old tokens)
+  if (!email) return res.status(403).json({ error: "Admin access required" });
+  getUserByEmail(email).then((u) => {
+    if (u?.is_admin) return next();
     return res.status(403).json({ error: "Admin access required" });
-  }
-  next();
+  }).catch(() => res.status(403).json({ error: "Admin access required" }));
 }
 
 
@@ -143,8 +151,12 @@ async function initDb() {
       email TEXT PRIMARY KEY,
       password_hash TEXT NOT NULL,
       balance INTEGER NOT NULL DEFAULT 0,
+      is_admin BOOLEAN NOT NULL DEFAULT FALSE,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+  `);
+  await pool.query(`
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;
   `);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS payments (
@@ -183,16 +195,18 @@ function normEmail(email) {
   return String(email || "").toLowerCase().trim();
 }
 function publicUserRow(r) {
-  return { email: r.email, balance: Number(r.balance || 0), createdAt: r.created_at };
+  return { email: r.email, balance: Number(r.balance || 0), isAdmin: !!r.is_admin, createdAt: r.created_at };
 }
-function signToken(email) {
-  return jwt.sign({ email }, JWT_SECRET, { expiresIn: "30d" });
+function signToken(email, is_admin) {
+  const payload = { email: String(email || "").toLowerCase() };
+  if (typeof is_admin !== "undefined") payload.is_admin = !!is_admin;
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: "30d" });
 }
 
 async function getUserByEmail(email) {
   const e = normEmail(email);
   const { rows } = await pool.query(
-    "SELECT email, password_hash, balance, created_at FROM users WHERE email=$1",
+    "SELECT email, password_hash, balance, is_admin, created_at FROM users WHERE email=$1",
     [e]
   );
   return rows[0] || null;
@@ -200,7 +214,7 @@ async function getUserByEmail(email) {
 async function createUser(email, passwordHash) {
   const e = normEmail(email);
   const { rows } = await pool.query(
-    "INSERT INTO users (email, password_hash, balance) VALUES ($1,$2,0) RETURNING email, password_hash, balance, created_at",
+    "INSERT INTO users (email, password_hash, balance, is_admin) VALUES ($1,$2,0,FALSE) RETURNING email, password_hash, balance, is_admin, created_at",
     [e, passwordHash]
   );
   return rows[0];
@@ -387,8 +401,21 @@ app.post("/api/auth/signup", async (req, res) => {
   if (existing) return res.status(409).json({ error: "Email already registered" });
 
   const passwordHash = await bcrypt.hash(String(password), 10);
-  const row = await createUser(e, passwordHash);
-  res.json({ token: signToken(e), user: publicUserRow(row) });
+  let row = await createUser(e, passwordHash);
+
+  // bootstrap first admin (if no admin emails configured and no admins in DB)
+  try {
+    const configured = (process.env.ADMIN_EMAIL || "").trim() || (process.env.ADMIN_EMAILS || "").trim();
+    if (!configured) {
+      const { rows } = await pool.query("SELECT COUNT(*)::int AS c FROM users WHERE is_admin=TRUE");
+      if ((rows?.[0]?.c || 0) === 0) {
+        await pool.query("UPDATE users SET is_admin=TRUE WHERE email=$1", [e]);
+        row = await getUserByEmail(e);
+      }
+    }
+  } catch {}
+
+  res.json({ token: signToken(e, row?.is_admin), user: publicUserRow(row) });
 });
 
 app.post("/api/auth/login", async (req, res) => {
@@ -402,7 +429,7 @@ app.post("/api/auth/login", async (req, res) => {
   const ok = await bcrypt.compare(String(password), String(u.password_hash || ""));
   if (!ok) return res.status(401).json({ error: "Invalid credentials" });
 
-  res.json({ token: signToken(e), user: publicUserRow(u) });
+  res.json({ token: signToken(e, u?.is_admin), user: publicUserRow(u) });
 });
 
 app.get("/api/auth/me", auth, async (req, res) => {
