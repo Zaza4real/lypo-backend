@@ -462,7 +462,7 @@ app.get("/api/account/videos", auth, asyncHandler(async (req, res) => {
     [email]
   );
   res.json({ videos: rows });
-});
+}));
 
 
 // ---- Stripe checkout: buy LYPOS
