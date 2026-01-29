@@ -15,17 +15,34 @@ const app = express();
    CORS
 ---------------------------- */
 const allowedOrigins = new Set([
+  // Production
+  "https://lypo.org",
+  "https://www.lypo.org",
+
+  // Legacy / misc
   "https://digitalgeekworld.com",
   "https://www.digitalgeekworld.com",
+
+  // Render preview
   "https://homepage-3d78.onrender.com",
-  process.env.FRONTEND_URL || ""
+
+  // Config-driven
+  process.env.FRONTEND_URL || "",
+  ...(process.env.CORS_EXTRA_ORIGINS ? process.env.CORS_EXTRA_ORIGINS.split(",").map(s => s.trim()) : [])
 ].filter(Boolean));
 
 const CORS_ALLOW_ALL = process.env.CORS_ALLOW_ALL === "1";
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (origin && (CORS_ALLOW_ALL || allowedOrigins.has(origin))) {
+  if (origin && (
+    CORS_ALLOW_ALL ||
+    allowedOrigins.has(origin) ||
+    // Allow Render subdomains (preview/production) without needing to enumerate each one
+    /\.onrender\.com$/.test(origin) ||
+    // Local dev
+    /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)
+  )) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
   res.setHeader("Vary", "Origin");
@@ -178,18 +195,14 @@ async function createUser(email, passwordHash) {
 
 async function recordPayment({ email, stripeSessionId, amountUsd, lypos, status, invoiceUrl }) {
   const e = normEmail(email);
-  // Return whether this was a NEW payment row (inserted) vs an update to an existing row.
-  // We use Postgres system column xmax: xmax=0 implies the row version was inserted by this statement.
-  const { rows } = await pool.query(
+  await pool.query(
     `INSERT INTO payments (email, stripe_session_id, amount_usd, lypos, status, invoice_url)
      VALUES ($1,$2,$3,$4,$5,$6)
      ON CONFLICT (stripe_session_id) DO UPDATE SET
        status=EXCLUDED.status,
-       invoice_url=COALESCE(EXCLUDED.invoice_url, payments.invoice_url)
-     RETURNING (xmax = 0) AS inserted`,
-    [e, stripeSessionId || null, Number(amountUsd || 0), Math.trunc(lypos || 0), status || "completed", invoiceUrl || null]
+       invoice_url=COALESCE(EXCLUDED.invoice_url, payments.invoice_url)`,
+    [e, stripeSessionId || null, Number(amountUsd||0), Math.trunc(lypos||0), status || "completed", invoiceUrl || null]
   );
-  return Boolean(rows?.[0]?.inserted);
 }
 
 async function upsertVideo({ email, predictionId, status, inputUrl, outputUrl }) {
@@ -297,10 +310,8 @@ try {
 
     if (email && lypos > 0) {
       try {
-        const inserted = await recordPayment({ email, stripeSessionId: sessionId, amountUsd: amountTotal, lypos, status: "completed", invoiceUrl });
-        if (inserted) {
-          await addBalance(email, lypos);
-        }
+        await recordPayment({ email, stripeSessionId: sessionId, amountUsd: amountTotal, lypos, status: "completed", invoiceUrl });
+        await addBalance(email, lypos);
         console.log("✅ Payment stored + credited LYPOS:", { email, lypos, amountTotal });
       } catch (e) {
         console.log("⚠️ Webhook credit failed:", e?.message || e);
@@ -453,24 +464,7 @@ app.get("/api/account/payments", auth, async (req, res) => {
     "SELECT stripe_session_id, amount_usd, lypos, status, invoice_url, created_at FROM payments WHERE email=$1 ORDER BY created_at DESC LIMIT 100",
     [email]
   );
-
-  // Normalize for frontend (avoid Safari 'Invalid Date' and support both camelCase + snake_case)
-  const payments = rows.map((r) => {
-    const createdAt = r.created_at ? new Date(r.created_at).toISOString() : null;
-    const invoiceUrl = r.invoice_url || null;
-    const amountUsd = (r.amount_usd != null) ? Number(r.amount_usd) : null;
-    return {
-      ...r,
-      created_at: createdAt,
-      createdAt,
-      invoice_url: invoiceUrl,
-      invoiceUrl,
-      amount_usd: amountUsd,
-      amountUsd
-    };
-  });
-
-  res.json({ payments });
+  res.json({ payments: rows });
 });
 
 app.get("/api/account/videos", auth, async (req, res) => {
@@ -575,7 +569,7 @@ app.get("/api/stripe/confirm", auth, async (req, res) => {
   }
 
   const bal = await getBalance(email);
-  res.json({ ok: true, balance: bal, invoice_url: invoiceUrl, invoiceUrl });
+  res.json({ ok: true, balance: bal, invoice_url: invoiceUrl });
 });
 
 /* ---------------------------
