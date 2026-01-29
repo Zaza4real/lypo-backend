@@ -15,8 +15,8 @@ const app = express();
    CORS
 ---------------------------- */
 const allowedOrigins = new Set([
-  "https://digitalgeekworld.com",
-  "https://www.digitalgeekworld.com",
+  "https://lypo.org",
+  "https://www.lypo.org",
   "https://homepage-3d78.onrender.com",
   process.env.FRONTEND_URL || ""
 ].filter(Boolean));
@@ -50,7 +50,7 @@ const JWT_SECRET = process.env.JWT_SECRET || "dev_change_me";
 
 // ---- Resend (HTTP email, no SMTP)
 const resend = new Resend(process.env.RESEND_API_KEY || "");
-const EMAIL_FROM = process.env.EMAIL_FROM || "LYPO <no-reply@digitalgeekworld.com>";
+const EMAIL_FROM = process.env.EMAIL_FROM || "LYPO <no-reply@lypo.org>";
 
 // ---- Postgres
 const { Pool } = pg;
