@@ -176,10 +176,9 @@ async function createUser(email, passwordHash) {
   return rows[0];
 }
 
-// Upsert a payment row and return whether it was newly inserted.
-// This lets us keep crediting idempotent (only credit on first insert).
 async function recordPayment({ email, stripeSessionId, amountUsd, lypos, status, invoiceUrl }) {
   const e = normEmail(email);
+  // Return whether this call inserted a NEW payment row (idempotency key is stripe_session_id)
   const { rows } = await pool.query(
     `INSERT INTO payments (email, stripe_session_id, amount_usd, lypos, status, invoice_url)
      VALUES ($1,$2,$3,$4,$5,$6)
@@ -189,8 +188,9 @@ async function recordPayment({ email, stripeSessionId, amountUsd, lypos, status,
      RETURNING (xmax = 0) AS inserted`,
     [e, stripeSessionId || null, Number(amountUsd || 0), Math.trunc(lypos || 0), status || "completed", invoiceUrl || null]
   );
-  return Boolean(rows?.[0]?.inserted);
+  return { inserted: Boolean(rows?.[0]?.inserted) };
 }
+
 
 async function upsertVideo({ email, predictionId, status, inputUrl, outputUrl }) {
   const e = normEmail(email);
@@ -297,15 +297,9 @@ try {
 
     if (email && lypos > 0) {
       try {
-        // IMPORTANT: only credit balance once per Stripe session.
-        // recordPayment() returns true if this is the *first* time we've seen this session.
-        const inserted = await recordPayment({ email, stripeSessionId: sessionId, amountUsd: amountTotal, lypos, status: "completed", invoiceUrl });
-        if (inserted) {
-          await addBalance(email, lypos);
-          console.log("✅ Payment stored + credited LYPOS:", { email, lypos, amountTotal });
-        } else {
-          console.log("ℹ️ Payment already recorded (no double-credit):", { email, lypos, amountTotal });
-        }
+        const rp = await recordPayment({ email, stripeSessionId: sessionId, amountUsd: amountTotal, lypos, status: "completed", invoiceUrl });
+        if (rp.inserted) await addBalance(email, lypos);
+        console.log("✅ Payment stored + credited LYPOS:", { email, lypos, amountTotal });
       } catch (e) {
         console.log("⚠️ Webhook credit failed:", e?.message || e);
       }
@@ -454,21 +448,24 @@ app.post("/api/credits/charge", auth, async (req, res) => {
 app.get("/api/account/payments", auth, async (req, res) => {
   const email = normEmail(req.user.email);
   const { rows } = await pool.query(
-    `SELECT
-       stripe_session_id AS "stripeSessionId",
-       amount_usd        AS "amountUsd",
-       lypos,
-       status,
-       invoice_url       AS "invoiceUrl",
-       created_at        AS "createdAt"
-     FROM payments
-     WHERE email=$1
-     ORDER BY created_at DESC
-     LIMIT 100`,
+    "SELECT stripe_session_id, amount_usd, lypos, status, invoice_url, created_at FROM payments WHERE email=$1 ORDER BY created_at DESC LIMIT 100",
     [email]
   );
-  res.json({ payments: rows });
+
+  const payments = rows.map((r) => ({
+    stripeSessionId: r.stripe_session_id || null,
+    amountUsd: typeof r.amount_usd === "number" ? r.amount_usd : Number(r.amount_usd || 0),
+    lypos: typeof r.lypos === "number" ? r.lypos : Number(r.lypos || 0),
+    status: r.status || null,
+    invoiceUrl: r.invoice_url || null,
+    // ensure frontend can safely do new Date(createdAt)
+    createdAt: r.created_at ? new Date(r.created_at).toISOString() : null
+  }));
+
+  res.json({ payments });
 });
+
+
 
 app.get("/api/account/videos", auth, async (req, res) => {
   const email = normEmail(req.user.email);
@@ -552,9 +549,9 @@ app.get("/api/stripe/confirm", auth, async (req, res) => {
     invoiceUrl = null;
   }
 
-  // Record payment + credit balance (idempotent: never double-credit for the same Stripe session)
+  // Record payment + credit balance (idempotent because stripe_session_id is UNIQUE)
   try {
-    const inserted = await recordPayment({
+    const rp = await recordPayment({
       email,
       stripeSessionId: session.id,
       amountUsd: amountTotal,
@@ -562,15 +559,17 @@ app.get("/api/stripe/confirm", auth, async (req, res) => {
       status: "completed",
       invoiceUrl
     });
-    if (inserted) {
-      await addBalance(email, credits);
-    }
+    if (rp.inserted) await addBalance(email, credits);
   } catch (e) {
-    console.log("⚠️ confirm payment failed:", e?.message || e);
+    // If already recorded, ignore; still return current balance
+    const msg = String(e?.message || "");
+    if (!msg.toLowerCase().includes("duplicate") && !msg.toLowerCase().includes("unique")) {
+      console.log("⚠️ confirm payment failed:", msg);
+    }
   }
 
   const bal = await getBalance(email);
-  res.json({ ok: true, balance: bal, invoiceUrl });
+  res.json({ ok: true, balance: bal, invoiceUrl, invoice_url: invoiceUrl });
 });
 
 /* ---------------------------
