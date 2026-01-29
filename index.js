@@ -178,7 +178,8 @@ async function createUser(email, passwordHash) {
 
 async function recordPayment({ email, stripeSessionId, amountUsd, lypos, status, invoiceUrl }) {
   const e = normEmail(email);
-  // Return whether this call inserted a NEW payment row (idempotency key is stripe_session_id)
+  // Return whether this was a NEW payment row (inserted) vs an update to an existing row.
+  // We use Postgres system column xmax: xmax=0 implies the row version was inserted by this statement.
   const { rows } = await pool.query(
     `INSERT INTO payments (email, stripe_session_id, amount_usd, lypos, status, invoice_url)
      VALUES ($1,$2,$3,$4,$5,$6)
@@ -188,9 +189,8 @@ async function recordPayment({ email, stripeSessionId, amountUsd, lypos, status,
      RETURNING (xmax = 0) AS inserted`,
     [e, stripeSessionId || null, Number(amountUsd || 0), Math.trunc(lypos || 0), status || "completed", invoiceUrl || null]
   );
-  return { inserted: Boolean(rows?.[0]?.inserted) };
+  return Boolean(rows?.[0]?.inserted);
 }
-
 
 async function upsertVideo({ email, predictionId, status, inputUrl, outputUrl }) {
   const e = normEmail(email);
@@ -297,8 +297,10 @@ try {
 
     if (email && lypos > 0) {
       try {
-        const rp = await recordPayment({ email, stripeSessionId: sessionId, amountUsd: amountTotal, lypos, status: "completed", invoiceUrl });
-        if (rp.inserted) await addBalance(email, lypos);
+        const inserted = await recordPayment({ email, stripeSessionId: sessionId, amountUsd: amountTotal, lypos, status: "completed", invoiceUrl });
+        if (inserted) {
+          await addBalance(email, lypos);
+        }
         console.log("✅ Payment stored + credited LYPOS:", { email, lypos, amountTotal });
       } catch (e) {
         console.log("⚠️ Webhook credit failed:", e?.message || e);
@@ -452,20 +454,24 @@ app.get("/api/account/payments", auth, async (req, res) => {
     [email]
   );
 
-  const payments = rows.map((r) => ({
-    stripeSessionId: r.stripe_session_id || null,
-    amountUsd: typeof r.amount_usd === "number" ? r.amount_usd : Number(r.amount_usd || 0),
-    lypos: typeof r.lypos === "number" ? r.lypos : Number(r.lypos || 0),
-    status: r.status || null,
-    invoiceUrl: r.invoice_url || null,
-    // ensure frontend can safely do new Date(createdAt)
-    createdAt: r.created_at ? new Date(r.created_at).toISOString() : null
-  }));
+  // Normalize for frontend (avoid Safari 'Invalid Date' and support both camelCase + snake_case)
+  const payments = rows.map((r) => {
+    const createdAt = r.created_at ? new Date(r.created_at).toISOString() : null;
+    const invoiceUrl = r.invoice_url || null;
+    const amountUsd = (r.amount_usd != null) ? Number(r.amount_usd) : null;
+    return {
+      ...r,
+      created_at: createdAt,
+      createdAt,
+      invoice_url: invoiceUrl,
+      invoiceUrl,
+      amount_usd: amountUsd,
+      amountUsd
+    };
+  });
 
   res.json({ payments });
 });
-
-
 
 app.get("/api/account/videos", auth, async (req, res) => {
   const email = normEmail(req.user.email);
@@ -551,7 +557,7 @@ app.get("/api/stripe/confirm", auth, async (req, res) => {
 
   // Record payment + credit balance (idempotent because stripe_session_id is UNIQUE)
   try {
-    const rp = await recordPayment({
+    await recordPayment({
       email,
       stripeSessionId: session.id,
       amountUsd: amountTotal,
@@ -559,7 +565,7 @@ app.get("/api/stripe/confirm", auth, async (req, res) => {
       status: "completed",
       invoiceUrl
     });
-    if (rp.inserted) await addBalance(email, credits);
+    await addBalance(email, credits);
   } catch (e) {
     // If already recorded, ignore; still return current balance
     const msg = String(e?.message || "");
@@ -569,7 +575,7 @@ app.get("/api/stripe/confirm", auth, async (req, res) => {
   }
 
   const bal = await getBalance(email);
-  res.json({ ok: true, balance: bal, invoiceUrl, invoice_url: invoiceUrl });
+  res.json({ ok: true, balance: bal, invoice_url: invoiceUrl, invoiceUrl });
 });
 
 /* ---------------------------
