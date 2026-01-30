@@ -43,10 +43,16 @@ import pg from "pg";
 import { Resend } from "resend";
 
 // Resend email client (safe init)
-const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+let resend = null;
+try {
+  const key = (process.env.RESEND_API_KEY || "").trim();
+  if (key) resend = new Resend(key);
+} catch (e) {
+  console.log("Resend init failed:", e?.message || e);
+}
 
 
-
+// Resend email client (safe init)
 // asyncHandler helper (prevents unhandled promise rejections in routes)
 const asyncHandler = (fn) => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch(next);
@@ -1246,6 +1252,21 @@ const PORT = process.env.PORT || 3000;
 
 initDb()
   .then(() => {
+
+  // Migration: ensure password_resets has expected columns (older DBs)
+  try {
+    await pool.query('ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS token TEXT;');
+    await pool.query('ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS email TEXT;');
+    await pool.query('ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();');
+    await pool.query('ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS used_at TIMESTAMPTZ;');
+    // Ensure token is the primary key when possible (won't break if already set)
+    // If existing PK differs, this will fail silently and we keep current PK.
+    try { await pool.query('ALTER TABLE password_resets ADD PRIMARY KEY (token);'); } catch(e) {}
+  } catch (e) {
+    // ignore if table doesn't exist yet
+  }
+
+
     console.log("✅ DB ready");
     app.listen(PORT, () => console.log(`LYPO backend running on ${PORT}`));
   })
