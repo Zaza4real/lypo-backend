@@ -555,6 +555,53 @@ app.get("/api/admin/status", auth, async (req, res) => {
   return res.json({ isAdmin: isAdminEmail(req.user?.email), email: req.user?.email || null });
 });
 
+
+app.get("/api/admin/users", auth, requireAdmin, asyncHandler(async (req, res) => {
+  const q = String(req.query.q || "").trim().toLowerCase();
+  const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit || "50"), 10) || 50));
+  const offset = Math.max(0, parseInt(String(req.query.offset || "0"), 10) || 0);
+
+  const params = [];
+  let where = "";
+  if (q) {
+    params.push(`%${q}%`);
+    where = `WHERE lower(email) LIKE $${params.length}`;
+  }
+  params.push(limit);
+  params.push(offset);
+
+  const { rows } = await pool.query(
+    `SELECT email, balance, is_admin, created_at FROM users ${where} ORDER BY created_at DESC LIMIT $${params.length-1} OFFSET $${params.length}`,
+    params
+  );
+  res.json({ users: rows });
+}));
+
+app.get("/api/admin/user-lookup", auth, requireAdmin, asyncHandler(async (req, res) => {
+  const email = normEmail(String(req.query.email || ""));
+  if (!email) return res.status(400).json({ error: "Email required" });
+
+  const u = await getUserByEmail(email);
+  if (!u) return res.status(404).json({ error: "User not found" });
+
+  const payments = (await pool.query(
+    "SELECT stripe_session_id, amount_usd, lypos, status, invoice_url, created_at FROM payments WHERE email=$1 ORDER BY created_at DESC LIMIT 100",
+    [email]
+  )).rows;
+
+  const videos = (await pool.query(
+    "SELECT prediction_id, status, input_url, output_url, cost_credits, refunded, created_at, updated_at FROM videos WHERE email=$1 ORDER BY created_at DESC LIMIT 100",
+    [email]
+  )).rows;
+
+  res.json({
+    user: { email: u.email, balance: u.balance, is_admin: u.is_admin, created_at: u.created_at },
+    payments,
+    videos
+  });
+}));
+
+
 app.post("/api/admin/add-credits", auth, async (req, res) => {
   if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
 
@@ -615,6 +662,7 @@ app.get("/api/account/videos", auth, asyncHandler(async (req, res) => {
 
 // ---- Stripe checkout: buy LYPOS
 app.post("/api/stripe/create-checkout-session", auth, async (req, res) => {
+  const frontendBase = (process.env.FRONTEND_URL || "").trim() || (req.headers.origin || "").trim() || FRONTEND_URL;
   const usd = Number(req.body?.usd || 0);
   if (!Number.isFinite(usd) || usd <= 0) return res.status(400).json({ error: "Invalid usd" });
 
@@ -635,8 +683,8 @@ app.post("/api/stripe/create-checkout-session", auth, async (req, res) => {
       }
     ],
     metadata: { email, lypos: String(lypos) },
-    success_url: `${FRONTEND_URL}/dashboard.html?paid=1&session_id={CHECKOUT_SESSION_ID}`,
-    cancel_url: `${FRONTEND_URL}/dashboard.html?paid=0`
+    success_url: `${frontendBase}/dashboard.html?paid=1&session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${frontendBase}/dashboard.html?paid=0`
   });
 
   res.json({ url: session.url });
