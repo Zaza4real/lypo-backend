@@ -1,36 +1,3 @@
-
-async function recordPaymentFromSessionIfMissing(sessionId, email) {
-  try {
-    const existing = await pool.query(
-      "SELECT 1 FROM payments WHERE stripe_session_id=$1 LIMIT 1",
-      [sessionId]
-    );
-    if (existing.rows.length) return;
-
-    const session = await stripe.checkout.sessions.retrieve(sessionId, {
-      expand: ["payment_intent", "line_items"]
-    });
-
-    if (session.payment_status !== "paid") return;
-
-    const amountUsd = (session.amount_total || 0) / 100;
-    const credits = Math.round(amountUsd * 100); // same logic you already use
-    const invoiceUrl = await resolveInvoiceUrlFromSession(session);
-
-    await pool.query(
-      `INSERT INTO payments (email, stripe_session_id, amount_usd, lypos, status, invoice_url)
-       VALUES ($1,$2,$3,$4,'paid',$5)`,
-      [email, sessionId, amountUsd, credits, invoiceUrl]
-    );
-
-    await pool.query(
-      "UPDATE users SET balance = balance + $1 WHERE email=$2",
-      [credits, email]
-    );
-  } catch (e) {
-    console.error("recordPaymentFromSessionIfMissing failed:", e.message);
-  }
-}
 import express from "express";
 import Replicate from "replicate";
 import Busboy from "busboy";
@@ -43,22 +10,6 @@ import pg from "pg";
 import { Resend } from "resend";
 
 const app = express();
-
-function requireAdmin(req, res, next) {
-  // Allow admin via env whitelist OR token flag OR DB flag
-  const email = req.user?.email;
-  const tokenAdmin = req.user?.is_admin === true;
-  const envAdmin = isAdminEmail(email);
-  if (envAdmin || tokenAdmin) return next();
-
-  // Fallback: check DB (helps old tokens)
-  if (!email) return res.status(403).json({ error: "Admin access required" });
-  getUserByEmail(email).then((u) => {
-    if (u?.is_admin) return next();
-    return res.status(403).json({ error: "Admin access required" });
-  }).catch(() => res.status(403).json({ error: "Admin access required" }));
-}
-
 
 /* ---------------------------
    CORS
@@ -74,37 +25,20 @@ const allowedOrigins = new Set([
 
 const CORS_ALLOW_ALL = process.env.CORS_ALLOW_ALL === "1";
 
-
-function isAllowedOrigin(origin) {
-  if (!origin) return false;
-  if (CORS_ALLOW_ALL) return true;
-  if (allowedOrigins.has(origin)) return true;
-
-  // Flexible allow rules (helps when deploying via Cloudflare/Render previews)
-  try {
-    const u = new URL(origin);
-    const h = (u.hostname || "").toLowerCase();
-    if (h === "lypo.org" || h.endsWith(".lypo.org")) return true;
-    if (h.endsWith(".onrender.com")) return true;
-    if (h.endsWith(".pages.dev") || h.endsWith(".workers.dev")) return true;
-  } catch {
-    // allow explicit "null" origin for local file testing
-    if (origin === "null") return true;
-  }
-  return false;
-}
-
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (origin && isAllowedOrigin(origin)) {
+  if (origin && (CORS_ALLOW_ALL || allowedOrigins.has(origin))) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
+
+// Async route wrapper to prevent unhandled promise rejections (which can crash the server)
+const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 /* ---------------------------
    Auth + Credits + Stripe (LYPOS)
@@ -178,38 +112,14 @@ const pool = new Pool({
   ssl: process.env.DISABLE_PG_SSL === "1" ? false : { rejectUnauthorized: false }
 });
 
-async function ensureBlogTables() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS blog_posts (
-      id SERIAL PRIMARY KEY,
-      slug TEXT UNIQUE NOT NULL,
-      title TEXT NOT NULL,
-      excerpt TEXT,
-      content_html TEXT NOT NULL,
-      cover_url TEXT,
-      video_url TEXT,
-      status TEXT NOT NULL DEFAULT 'draft',
-      published_at TIMESTAMPTZ,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      author_email TEXT
-    );
-  `);
-}
-
-
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       email TEXT PRIMARY KEY,
       password_hash TEXT NOT NULL,
       balance INTEGER NOT NULL DEFAULT 0,
-      is_admin BOOLEAN NOT NULL DEFAULT FALSE,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
-  `);
-  await pool.query(`
-    ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;
   `);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS payments (
@@ -248,18 +158,16 @@ function normEmail(email) {
   return String(email || "").toLowerCase().trim();
 }
 function publicUserRow(r) {
-  return { email: r.email, balance: Number(r.balance || 0), isAdmin: !!r.is_admin, createdAt: r.created_at };
+  return { email: r.email, balance: Number(r.balance || 0), createdAt: r.created_at };
 }
-function signToken(email, is_admin) {
-  const payload = { email: String(email || "").toLowerCase() };
-  if (typeof is_admin !== "undefined") payload.is_admin = !!is_admin;
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: "30d" });
+function signToken(email) {
+  return jwt.sign({ email }, JWT_SECRET, { expiresIn: "30d" });
 }
 
 async function getUserByEmail(email) {
   const e = normEmail(email);
   const { rows } = await pool.query(
-    "SELECT email, password_hash, balance, is_admin, created_at FROM users WHERE email=$1",
+    "SELECT email, password_hash, balance, created_at FROM users WHERE email=$1",
     [e]
   );
   return rows[0] || null;
@@ -267,52 +175,51 @@ async function getUserByEmail(email) {
 async function createUser(email, passwordHash) {
   const e = normEmail(email);
   const { rows } = await pool.query(
-    "INSERT INTO users (email, password_hash, balance, is_admin) VALUES ($1,$2,0,FALSE) RETURNING email, password_hash, balance, is_admin, created_at",
+    "INSERT INTO users (email, password_hash, balance) VALUES ($1,$2,0) RETURNING email, password_hash, balance, created_at",
     [e, passwordHash]
   );
   return rows[0];
 }
 
-
-async function resolveInvoiceUrlFromSession(session) {
-  let invoiceUrl = null;
-  try {
-    // For one-time payments, Stripe may not create an invoice.
-    if (session?.invoice) {
-      const inv = await stripe.invoices.retrieve(String(session.invoice));
-      invoiceUrl = inv.invoice_pdf || inv.hosted_invoice_url || null;
-    } else if (session?.payment_intent) {
-      const piId = typeof session.payment_intent === "string" ? session.payment_intent : session.payment_intent.id;
-      const pi = await stripe.paymentIntents.retrieve(String(piId), { expand: ["charges"] });
-      const charge = pi?.charges?.data?.[0];
-      invoiceUrl = charge?.receipt_url || null;
-    }
-  } catch {
-    invoiceUrl = null;
-  }
-  return invoiceUrl;
-}
-
-async function resolveInvoiceUrlBySessionId(sessionId) {
-  try {
-    const session = await stripe.checkout.sessions.retrieve(String(sessionId), { expand: ["payment_intent"] });
-    return await resolveInvoiceUrlFromSession(session);
-  } catch {
-    return null;
-  }
-}
-
 async function recordPayment({ email, stripeSessionId, amountUsd, lypos, status, invoiceUrl }) {
   const e = normEmail(email);
-  await pool.query(
-    `INSERT INTO payments (email, stripe_session_id, amount_usd, lypos, status, invoice_url)
-     VALUES ($1,$2,$3,$4,$5,$6)
-     ON CONFLICT (stripe_session_id) DO UPDATE SET
-       status=EXCLUDED.status,
-       invoice_url=COALESCE(EXCLUDED.invoice_url, payments.invoice_url)`,
-    [e, stripeSessionId || null, Number(amountUsd||0), Math.trunc(lypos||0), status || "completed", invoiceUrl || null]
-  );
+  const sid = stripeSessionId || null;
+  if (!sid) throw new Error("Missing stripeSessionId");
+
+  // Idempotent write without requiring a UNIQUE constraint (Render DB schema may differ).
+  // Strategy: try UPDATE first; if nothing updated, INSERT if not exists.
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const upd = await client.query(
+      `UPDATE payments
+         SET status=$1,
+             invoice_url=COALESCE($2, invoice_url),
+             amount_usd=COALESCE(NULLIF($3,0), amount_usd),
+             lypos=COALESCE(NULLIF($4,0), lypos)
+       WHERE stripe_session_id=$5 AND email=$6`,
+      [status || "completed", invoiceUrl || null, Number(amountUsd || 0), Math.trunc(lypos || 0), sid, e]
+    );
+
+    if (upd.rowCount === 0) {
+      await client.query(
+        `INSERT INTO payments (email, stripe_session_id, amount_usd, lypos, status, invoice_url)
+         SELECT $1,$2,$3,$4,$5,$6
+         WHERE NOT EXISTS (SELECT 1 FROM payments WHERE stripe_session_id=$2 AND email=$1)`,
+        [e, sid, Number(amountUsd || 0), Math.trunc(lypos || 0), status || "completed", invoiceUrl || null]
+      );
+    }
+
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 }
+
 
 async function upsertVideo({ email, predictionId, status, inputUrl, outputUrl }) {
   const e = normEmail(email);
@@ -483,21 +390,8 @@ app.post("/api/auth/signup", async (req, res) => {
   if (existing) return res.status(409).json({ error: "Email already registered" });
 
   const passwordHash = await bcrypt.hash(String(password), 10);
-  let row = await createUser(e, passwordHash);
-
-  // bootstrap first admin (if no admin emails configured and no admins in DB)
-  try {
-    const configured = (process.env.ADMIN_EMAIL || "").trim() || (process.env.ADMIN_EMAILS || "").trim();
-    if (!configured) {
-      const { rows } = await pool.query("SELECT COUNT(*)::int AS c FROM users WHERE is_admin=TRUE");
-      if ((rows?.[0]?.c || 0) === 0) {
-        await pool.query("UPDATE users SET is_admin=TRUE WHERE email=$1", [e]);
-        row = await getUserByEmail(e);
-      }
-    }
-  } catch {}
-
-  res.json({ token: signToken(e, row?.is_admin), user: publicUserRow(row) });
+  const row = await createUser(e, passwordHash);
+  res.json({ token: signToken(e), user: publicUserRow(row) });
 });
 
 app.post("/api/auth/login", async (req, res) => {
@@ -511,7 +405,7 @@ app.post("/api/auth/login", async (req, res) => {
   const ok = await bcrypt.compare(String(password), String(u.password_hash || ""));
   if (!ok) return res.status(401).json({ error: "Invalid credentials" });
 
-  res.json({ token: signToken(e, u?.is_admin), user: publicUserRow(u) });
+  res.json({ token: signToken(e), user: publicUserRow(u) });
 });
 
 app.get("/api/auth/me", auth, async (req, res) => {
@@ -580,43 +474,27 @@ app.post("/api/credits/charge", auth, async (req, res) => {
 
 
 // ---- Account dashboard
-app.get("/api/account/payments", auth, async (req, res) => {
+app.get("/api/account/payments", auth, asyncHandler(async (req, res) => {
   const email = normEmail(req.user.email);
-
-  // Recover missed Stripe payments
-  try {
-    const sessions = await stripe.checkout.sessions.list({
-      limit: 5,
-      customer_email: email
-    });
-    for (const s of sessions.data) {
-      if (s.payment_status === "paid") {
-        await recordPaymentFromSessionIfMissing(s.id, email);
-      }
-    }
-  } catch (e) {}
-
   const { rows } = await pool.query(
     "SELECT stripe_session_id, amount_usd, lypos, status, invoice_url, created_at FROM payments WHERE email=$1 ORDER BY created_at DESC LIMIT 100",
     [email]
   );
   res.json({ payments: rows });
-});
+}));
 
-
-app.get("/api/account/videos", auth, async (req, res) => {
+app.get("/api/account/videos", auth, asyncHandler(async (req, res) => {
   const email = normEmail(req.user.email);
   const { rows } = await pool.query(
     "SELECT prediction_id, status, input_url, output_url, created_at FROM videos WHERE email=$1 ORDER BY created_at DESC LIMIT 100",
     [email]
   );
   res.json({ videos: rows });
-});
+}));
 
 
 // ---- Stripe checkout: buy LYPOS
 app.post("/api/stripe/create-checkout-session", auth, async (req, res) => {
-  const frontendBase = (process.env.FRONTEND_URL || "").trim() || (req.headers.origin || "").trim() || (FRONTEND_URL || "").trim();
   const usd = Number(req.body?.usd || 0);
   if (!Number.isFinite(usd) || usd <= 0) return res.status(400).json({ error: "Invalid usd" });
 
@@ -637,20 +515,21 @@ app.post("/api/stripe/create-checkout-session", auth, async (req, res) => {
       }
     ],
     metadata: { email, lypos: String(lypos) },
-    success_url: `${frontendBase}/dashboard.html?paid=1&session_id={CHECKOUT_SESSION_ID}`,
-    cancel_url: `${frontendBase}/dashboard.html?paid=0`});
+    success_url: `${FRONTEND_URL}/dashboard.html?paid=1&session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${FRONTEND_URL}/dashboard.html?paid=0`
+  });
 
   res.json({ url: session.url });
 });
 
 // Confirm Checkout Session on return (fallback if webhook is not configured)
 // Idempotent: will not double-credit if already recorded.
-app.get("/api/stripe/confirm", auth, async (req, res) => {
+app.get("/api/stripe/confirm", auth, asyncHandler(async (req, res) => {
   const sessionId = String(req.query?.session_id || "").trim();
   if (!sessionId) return res.status(400).json({ error: "Missing session_id" });
 
   // Retrieve the session from Stripe
-  const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ["payment_intent", "payment_intent.charges"] });
+  const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ["payment_intent", "payment_intent.latest_charge"] });
 
   // Must belong to the logged-in user
   const email = req.user.email;
@@ -679,7 +558,10 @@ app.get("/api/stripe/confirm", auth, async (req, res) => {
       invoiceUrl = inv.invoice_pdf || inv.hosted_invoice_url || null;
     } else {
       const pi = session.payment_intent;
-      const charge = pi?.charges?.data?.[0];
+      let charge = pi?.latest_charge;
+      if (charge && typeof charge === "string") {
+        charge = await stripe.charges.retrieve(charge);
+      }
       invoiceUrl = charge?.receipt_url || null;
     }
   } catch {
@@ -706,8 +588,8 @@ app.get("/api/stripe/confirm", auth, async (req, res) => {
   }
 
   const bal = await getBalance(email);
-  res.json({ ok: true, balance: bal, invoice_url: invoiceUrl });
-});
+  res.json({ ok: true, balance: bal, invoice_url: invoiceUrl, invoiceUrl });
+}));
 
 /* ---------------------------
    ENV
@@ -939,152 +821,23 @@ const PORT = process.env.PORT || 3000;
 initDb()
   .then(() => {
     console.log("✅ DB ready");
-    app.listen(PORT, () => console.log(`LYPO backend running on ${PORT}`));
+    
+// Global error handler (ensures we respond instead of crashing, which can surface as 502 + CORS errors)
+app.use((err, req, res, next) => {
+  try {
+    console.log("❌ Unhandled error:", err?.stack || err);
+    if (res.headersSent) return next(err);
+    const status = Number(err?.statusCode || err?.status || 500);
+    res.status(status).json({ error: err?.message || "Internal Server Error" });
+  } catch (e) {
+    // Last resort: avoid crashing
+    try { res.status(500).json({ error: "Internal Server Error" }); } catch {}
+  }
+});
+
+app.listen(PORT, () => console.log(`LYPO backend running on ${PORT}`));
   })
   .catch((e) => {
     console.error("❌ DB init failed", e);
     process.exit(1);
   });
-(async () => {
-  try { await ensureBlogTables(); } catch (e) { console.error('Blog table init failed:', e); }
-})();
-
-
-/* ---------------------------
-   BLOG (public)
----------------------------- */
-app.get("/api/blog/posts", async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT id, slug, title, excerpt, cover_url, video_url, published_at
-       FROM blog_posts
-       WHERE status='published'
-       ORDER BY published_at DESC NULLS LAST, created_at DESC
-       LIMIT 50`
-    );
-    res.json({ posts: rows });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Could not load posts" });
-  }
-});
-
-app.get("/api/blog/posts/:slug", async (req, res) => {
-  try {
-    const slug = String(req.params.slug || "");
-    const { rows } = await pool.query(
-      `SELECT id, slug, title, excerpt, content_html, cover_url, video_url, published_at
-       FROM blog_posts
-       WHERE slug=$1 AND status='published'
-       LIMIT 1`,
-      [slug]
-    );
-    const post = rows[0];
-    if (!post) return res.status(404).json({ error: "Not found" });
-    res.json({ post });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Could not load post" });
-  }
-});
-
-/* ---------------------------
-   BLOG (admin)
----------------------------- */
-app.get("/api/admin/blog/posts", auth, requireAdmin, async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT id, slug, title, excerpt, status, published_at, created_at, updated_at
-       FROM blog_posts
-       ORDER BY created_at DESC
-       LIMIT 200`
-    );
-    res.json({ posts: rows });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Could not load admin posts" });
-  }
-});
-
-
-app.get("/api/admin/blog/posts/:id", auth, requireAdmin, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    if (!id) return res.status(400).json({ error: "Bad id" });
-    const { rows } = await pool.query(
-      `SELECT id, slug, title, excerpt, content_html, cover_url, video_url, status, published_at, created_at, updated_at
-       FROM blog_posts
-       WHERE id=$1
-       LIMIT 1`,
-      [id]
-    );
-    if (!rows[0]) return res.status(404).json({ error: "Not found" });
-    res.json({ post: rows[0] });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Could not load post" });
-  }
-});
-
-
-app.post("/api/admin/blog/posts", auth, requireAdmin, async (req, res) => {
-  try {
-    const { slug, title, excerpt, content_html, cover_url, video_url, status } = req.body || {};
-    if (!slug || !title || !content_html) return res.status(400).json({ error: "Missing slug, title, or content" });
-    const st = (status === "published") ? "published" : "draft";
-    const publishedAt = st === "published" ? new Date() : null;
-
-    const { rows } = await pool.query(
-      `INSERT INTO blog_posts (slug, title, excerpt, content_html, cover_url, video_url, status, published_at, author_email)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-       RETURNING id, slug, title, excerpt, status, published_at`,
-      [slug, title, excerpt || null, content_html, cover_url || null, video_url || null, st, publishedAt, req.user.email || null]
-    );
-    res.json({ post: rows[0] });
-  } catch (e) {
-    console.error(e);
-    const msg = String(e?.message || "");
-    if (msg.includes("duplicate key")) return res.status(409).json({ error: "Slug already exists" });
-    res.status(500).json({ error: "Could not create post" });
-  }
-});
-
-app.put("/api/admin/blog/posts/:id", auth, requireAdmin, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    const { slug, title, excerpt, content_html, cover_url, video_url, status } = req.body || {};
-    if (!id || !slug || !title || !content_html) return res.status(400).json({ error: "Missing fields" });
-
-    const st = (status === "published") ? "published" : "draft";
-    const publishedAt = st === "published" ? (req.body.published_at ? new Date(req.body.published_at) : new Date()) : null;
-
-    const { rows } = await pool.query(
-      `UPDATE blog_posts
-       SET slug=$1, title=$2, excerpt=$3, content_html=$4, cover_url=$5, video_url=$6,
-           status=$7, published_at=$8, updated_at=NOW()
-       WHERE id=$9
-       RETURNING id, slug, title, excerpt, status, published_at`,
-      [slug, title, excerpt || null, content_html, cover_url || null, video_url || null, st, publishedAt, id]
-    );
-    if (!rows[0]) return res.status(404).json({ error: "Not found" });
-    res.json({ post: rows[0] });
-  } catch (e) {
-    console.error(e);
-    const msg = String(e?.message || "");
-    if (msg.includes("duplicate key")) return res.status(409).json({ error: "Slug already exists" });
-    res.status(500).json({ error: "Could not update post" });
-  }
-});
-
-app.delete("/api/admin/blog/posts/:id", auth, requireAdmin, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    if (!id) return res.status(400).json({ error: "Bad id" });
-    await pool.query(`DELETE FROM blog_posts WHERE id=$1`, [id]);
-    res.json({ ok: true });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Could not delete post" });
-  }
-});
-
