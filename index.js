@@ -1253,19 +1253,6 @@ const PORT = process.env.PORT || 3000;
 initDb()
   .then(() => {
 
-  // Migration: ensure password_resets has expected columns (older DBs)
-  try {
-    await pool.query('ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS token TEXT;');
-    await pool.query('ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS email TEXT;');
-    await pool.query('ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();');
-    await pool.query('ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS used_at TIMESTAMPTZ;');
-    // Ensure token is the primary key when possible (won't break if already set)
-    // If existing PK differs, this will fail silently and we keep current PK.
-    try { await pool.query('ALTER TABLE password_resets ADD PRIMARY KEY (token);'); } catch(e) {}
-  } catch (e) {
-    // ignore if table doesn't exist yet
-  }
-
 
     console.log("✅ DB ready");
     app.listen(PORT, () => console.log(`LYPO backend running on ${PORT}`));
