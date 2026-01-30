@@ -74,9 +74,29 @@ const allowedOrigins = new Set([
 
 const CORS_ALLOW_ALL = process.env.CORS_ALLOW_ALL === "1";
 
+
+function isAllowedOrigin(origin) {
+  if (!origin) return false;
+  if (CORS_ALLOW_ALL) return true;
+  if (allowedOrigins.has(origin)) return true;
+
+  // Flexible allow rules (helps when deploying via Cloudflare/Render previews)
+  try {
+    const u = new URL(origin);
+    const h = (u.hostname || "").toLowerCase();
+    if (h === "lypo.org" || h.endsWith(".lypo.org")) return true;
+    if (h.endsWith(".onrender.com")) return true;
+    if (h.endsWith(".pages.dev") || h.endsWith(".workers.dev")) return true;
+  } catch {
+    // allow explicit "null" origin for local file testing
+    if (origin === "null") return true;
+  }
+  return false;
+}
+
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (origin && (CORS_ALLOW_ALL || allowedOrigins.has(origin))) {
+  if (origin && isAllowedOrigin(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
   res.setHeader("Vary", "Origin");
