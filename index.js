@@ -120,7 +120,22 @@ async function initDb() {
       balance INTEGER NOT NULL DEFAULT 0,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
-  `);
+  
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS blog_posts (
+        id SERIAL PRIMARY KEY,
+        title TEXT NOT NULL,
+        slug TEXT UNIQUE NOT NULL,
+        excerpt TEXT DEFAULT '',
+        cover_url TEXT DEFAULT '',
+        video_url TEXT DEFAULT '',
+        content_html TEXT DEFAULT '',
+        status TEXT DEFAULT 'draft',
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS payments (
       id BIGSERIAL PRIMARY KEY,
@@ -611,24 +626,19 @@ app.get("/api/admin/users", auth, asyncHandler(async (req, res) => {
   const offset = Math.max(parseInt(req.query?.offset || "0", 10) || 0, 0);
   const q = String(req.query?.q || "").trim();
 
-  const sqlBase = "SELECT email, balance, created_at FROM users";
-  const sqlWhere = q ? " WHERE email ILIKE $1" : "";
-  const sqlOrder = " ORDER BY created_at DESC";
-  const sqlLimit = q ? " LIMIT $2 OFFSET $3" : " LIMIT $1 OFFSET $2";
+  const params = [];
+  let where = "";
+  if (q) { params.push(`%${q}%`); where = ` WHERE email ILIKE $${params.length}`; }
+  params.push(limit); params.push(offset);
 
-  const params = q ? [`%${q}%`, limit, offset] : [limit, offset];
-  const rows = (await pool.query(sqlBase + sqlWhere + sqlOrder + sqlLimit, params)).rows;
+  const rows = (await pool.query(
+    `SELECT email, balance, created_at FROM users${where} ORDER BY created_at DESC LIMIT $${params.length-1} OFFSET $${params.length}`,
+    params
+  )).rows;
 
-  return res.json({
-    users: rows.map(u => ({
-      email: u.email,
-      balance: Number(u.balance || 0),
-      created_at: u.created_at,
-      is_admin: isAdminEmail(u.email)
-    })),
-    limit,
-    offset,
-    q
+  res.json({
+    users: rows.map(u => ({ email: u.email, balance: Number(u.balance || 0), created_at: u.created_at, is_admin: isAdminEmail(u.email) })),
+    limit, offset, q
   });
 }));
 
@@ -1015,6 +1025,79 @@ app.use((err, req, res, next) => {
     try { res.status(500).json({ error: "Internal Server Error" }); } catch {}
   }
 });
+
+// ---- Blog (public)
+app.get("/api/blog/posts", asyncHandler(async (req, res) => {
+  const rows = (await pool.query(
+    "SELECT id, title, slug, excerpt, cover_url, video_url, content_html, created_at, updated_at FROM blog_posts WHERE status='published' ORDER BY created_at DESC LIMIT 200"
+  )).rows;
+  res.json({ posts: rows });
+}));
+
+app.get("/api/blog/posts/:slug", asyncHandler(async (req, res) => {
+  const slug = String(req.params.slug || "");
+  const row = (await pool.query(
+    "SELECT id, title, slug, excerpt, cover_url, video_url, content_html, created_at, updated_at FROM blog_posts WHERE slug=$1 AND status='published' LIMIT 1",
+    [slug]
+  )).rows[0];
+  if (!row) return res.status(404).json({ error: "NOT_FOUND" });
+  res.json({ post: row });
+}));
+
+// ---- Blog (admin)
+app.get("/api/admin/blog/posts", auth, asyncHandler(async (req, res) => {
+  if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
+  const rows = (await pool.query(
+    "SELECT id, title, slug, excerpt, cover_url, video_url, content_html, status, created_at, updated_at FROM blog_posts ORDER BY created_at DESC LIMIT 500"
+  )).rows;
+  res.json({ posts: rows });
+}));
+
+app.post("/api/admin/blog/posts", auth, asyncHandler(async (req, res) => {
+  if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
+  const b = req.body || {};
+  const title = String(b.title || "").trim();
+  const slug = String(b.slug || "").trim();
+  if (!title || !slug) return res.status(400).json({ error: "MISSING_FIELDS" });
+  const excerpt = String(b.excerpt || "");
+  const cover_url = String(b.cover_url || "");
+  const video_url = String(b.video_url || "");
+  const content_html = String(b.content_html || "");
+  const status = String(b.status || "draft");
+  const row = (await pool.query(
+    "INSERT INTO blog_posts (title, slug, excerpt, cover_url, video_url, content_html, status) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *",
+    [title, slug, excerpt, cover_url, video_url, content_html, status]
+  )).rows[0];
+  res.json({ post: row });
+}));
+
+app.put("/api/admin/blog/posts/:id", auth, asyncHandler(async (req, res) => {
+  if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
+  const id = parseInt(req.params.id, 10);
+  const b = req.body || {};
+  const title = String(b.title || "").trim();
+  const slug = String(b.slug || "").trim();
+  if (!id || !title || !slug) return res.status(400).json({ error: "MISSING_FIELDS" });
+  const excerpt = String(b.excerpt || "");
+  const cover_url = String(b.cover_url || "");
+  const video_url = String(b.video_url || "");
+  const content_html = String(b.content_html || "");
+  const status = String(b.status || "draft");
+  const row = (await pool.query(
+    "UPDATE blog_posts SET title=$1, slug=$2, excerpt=$3, cover_url=$4, video_url=$5, content_html=$6, status=$7, updated_at=NOW() WHERE id=$8 RETURNING *",
+    [title, slug, excerpt, cover_url, video_url, content_html, status, id]
+  )).rows[0];
+  if (!row) return res.status(404).json({ error: "NOT_FOUND" });
+  res.json({ post: row });
+}));
+
+app.delete("/api/admin/blog/posts/:id", auth, asyncHandler(async (req, res) => {
+  if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
+  const id = parseInt(req.params.id, 10);
+  if (!id) return res.status(400).json({ error: "MISSING_ID" });
+  await pool.query("DELETE FROM blog_posts WHERE id=$1", [id]);
+  res.json({ ok: true });
+}));
 
 app.listen(PORT, () => console.log(`LYPO backend running on ${PORT}`));
   })
