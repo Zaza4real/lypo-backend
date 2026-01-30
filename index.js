@@ -7,6 +7,7 @@ import Stripe from "stripe";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import pg from "pg";
+import { Resend } from "resend";
 
 
 // async wrapper for express routes
@@ -23,7 +24,7 @@ function asyncHandler(fn){
      SUPPORT_EMAIL    = where to notify (e.g. support@lypo.org)
      EMAIL_FROM       = verified sender (e.g. Lypo <no-reply@lypo.org>)
 ---------------------------- */
-async function sendSupportNewUserEmail({ email }) {
+async function sendSupportNewUserEmail({ email, ip, ua }) {
   const apiKey = process.env.RESEND_API_KEY || "";
   const to = process.env.SUPPORT_EMAIL || "";
   const from = process.env.EMAIL_FROM || "Lypo <no-reply@lypo.org>";
@@ -33,31 +34,28 @@ async function sendSupportNewUserEmail({ email }) {
     return;
   }
 
+  const resend = new Resend(apiKey);
   const subject = `🆕 New user signup: ${email}`;
   const html = `
     <div style="font-family:Arial,sans-serif;line-height:1.5">
       <h2 style="margin:0 0 12px 0;">New user created</h2>
       <p style="margin:0 0 8px 0;"><strong>Email:</strong> ${email}</p>
+      ${ip ? `<p style="margin:0 0 8px 0;"><strong>IP:</strong> ${ip}</p>` : ``}
+      ${ua ? `<p style="margin:0 0 8px 0;"><strong>User-Agent:</strong> ${ua}</p>` : ``}
       <p style="margin:0;color:#666;">Timestamp (UTC): ${new Date().toISOString()}</p>
     </div>
   `;
 
-  const resp = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${apiKey}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({ from, to, subject, html })
-  });
-
-  if (!resp.ok) {
-    const txt = await resp.text().catch(() => "");
-    console.error("❌ Resend error:", resp.status, txt);
+  try {
+    await resend.emails.send({ from, to, subject, html });
+  } catch (err) {
+    console.error("❌ Resend error:", err);
   }
 }
 
 const app = express();
+app.set("trust proxy", 1);
+
 
 /* ---------------------------
    CORS
@@ -330,12 +328,69 @@ try {
 }));
 
 // JSON for normal routes
+
+/* ---------------------------
+   Basic security & diagnostics
+---------------------------- */
+app.use((req, res, next) => {
+  // simple request id
+  const rid = req.headers["x-request-id"] || crypto.randomUUID();
+  res.setHeader("X-Request-Id", rid);
+
+  // security headers (lightweight, no design changes)
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "same-origin");
+  res.setHeader("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
+  next();
+});
+
+// Fast OPTIONS response for CORS preflight
+app.options("*", (req, res) => {
+  res.sendStatus(204);
+});
+
 app.use(express.json({ limit: "2mb" }));
 
+
+app.get("/api/health", (req, res) => {
+  res.json({ ok: true, ts: new Date().toISOString() });
+});
+
+
+function isValidEmail(email){
+  const e = String(email || "").trim().toLowerCase();
+  // simple, practical email check
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
+}
+
+// Very small in-memory rate limit (per IP) for auth endpoints
+const __authHits = new Map(); // ip -> {count, resetAt}
+function authRateLimit(req, res, next){
+  const ip = (req.headers["x-forwarded-for"] || req.ip || "").toString().split(",")[0].trim() || "unknown";
+  const now = Date.now();
+  const windowMs = 60_000; // 1 min
+  const max = 20;
+
+  const entry = __authHits.get(ip) || { count: 0, resetAt: now + windowMs };
+  if (now > entry.resetAt) {
+    entry.count = 0;
+    entry.resetAt = now + windowMs;
+  }
+  entry.count += 1;
+  __authHits.set(ip, entry);
+
+  if (entry.count > max) {
+    return res.status(429).json({ error: "RATE_LIMIT", message: "Too many requests. Try again in a minute." });
+  }
+  next();
+}
+
 // ---- Auth routes
-app.post("/api/auth/signup", asyncHandler(async (req, res) => {
+app.post("/api/auth/signup", authRateLimit, asyncHandler(async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: "Missing email/password" });
+  if (!isValidEmail(email)) return res.status(400).json({ error: "Invalid email" });
   if (String(password).length < 6) return res.status(400).json({ error: "Password too short (min 6)" });
 
   const e = normEmail(email);
@@ -346,14 +401,15 @@ app.post("/api/auth/signup", asyncHandler(async (req, res) => {
   const row = await createUser(e, passwordHash);
   
   // Notify support (non-blocking)
-  Promise.resolve(sendSupportNewUserEmail({ email: e })).catch((err) => console.error("Support email failed:", err));
+  Promise.resolve(sendSupportNewUserEmail({ email: e, ip: (req.headers["x-forwarded-for"]||req.ip||"").toString().split(",")[0].trim(), ua: req.headers["user-agent"]||"" })).catch((err) => console.error("Support email failed:", err));
 
   res.json({ token: signToken(e), user: publicUserRow(row) });
 }));
 
-app.post("/api/auth/login", asyncHandler(async (req, res) => {
+app.post("/api/auth/login", authRateLimit, asyncHandler(async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: "Missing email/password" });
+  if (!isValidEmail(email)) return res.status(400).json({ error: "Invalid email" });
 
   const e = normEmail(email);
   const u = await getUserByEmail(e);
@@ -932,4 +988,13 @@ app.use((err, req, res, next) => {
     error: "SERVER_ERROR",
     message: err.message || "Unknown error"
   });
+});
+
+
+// Process-level safety (logs only; keeps Render logs useful)
+process.on("unhandledRejection", (reason) => {
+  console.error("🔥 UnhandledRejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("🔥 UncaughtException:", err);
 });
