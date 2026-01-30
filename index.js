@@ -781,25 +781,6 @@ const replicate = new Replicate({
 /* ---------------------------
    ENV
 ---------------------------- */
-const {
-  REPLICATE_API_TOKEN,
-  REPLICATE_MODEL_VERSION, // REQUIRED
-  S3_ENDPOINT,
-  S3_REGION = "auto",
-  S3_ACCESS_KEY_ID,
-  S3_SECRET_ACCESS_KEY,
-  S3_BUCKET,
-  PUBLIC_BASE_URL
-} = process.env;
-
-function requireEnv(name, value) {
-  if (!value) {
-    const err = new Error(`Missing env var: ${name}`);
-    err.statusCode = 500;
-    throw err;
-  }
-  return value;
-}
 
 /* ---------------------------
    Replicate client
