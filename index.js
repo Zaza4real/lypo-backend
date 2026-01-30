@@ -571,6 +571,38 @@ app.post("/api/admin/add-credits", auth, async (req, res) => {
   return res.json({ ok: true, user: { email, balance: out.balance } });
 });
 
+// ---- Admin: Support lookup (user history)
+app.get("/api/admin/user-lookup", auth, asyncHandler(async (req, res) => {
+  if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
+
+  const email = normEmail(String(req.query?.email || ""));
+  if (!email) return res.status(400).json({ error: "MISSING_EMAIL" });
+
+  const u = await getUserByEmail(email);
+  if (!u) return res.status(404).json({ error: "USER_NOT_FOUND" });
+
+  const payments = (await pool.query(
+    "SELECT stripe_session_id, amount_usd, lypos, status, invoice_url, created_at FROM payments WHERE email=$1 ORDER BY created_at DESC LIMIT 200",
+    [email]
+  )).rows;
+
+  const videos = (await pool.query(
+    "SELECT prediction_id, status, input_url, output_url, cost_credits, created_at FROM videos WHERE email=$1 ORDER BY created_at DESC LIMIT 200",
+    [email]
+  )).rows;
+
+  return res.json({
+    user: {
+      email: u.email,
+      balance: Number(u.balance || 0),
+      created_at: u.created_at,
+      is_admin: isAdminEmail(u.email)
+    },
+    payments,
+    videos
+  });
+}));
+
 app.get("/api/credits", auth, async (req, res) => {
   const email = req.user.email;
   const u = await getUserByEmail(email);
