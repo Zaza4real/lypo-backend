@@ -14,6 +14,49 @@ function asyncHandler(fn){
   return (req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next);
 }
 
+
+
+/* ---------------------------
+   Support notification email (Resend)
+   Env:
+     RESEND_API_KEY   = your Resend API key
+     SUPPORT_EMAIL    = where to notify (e.g. support@lypo.org)
+     EMAIL_FROM       = verified sender (e.g. Lypo <no-reply@lypo.org>)
+---------------------------- */
+async function sendSupportNewUserEmail({ email }) {
+  const apiKey = process.env.RESEND_API_KEY || "";
+  const to = process.env.SUPPORT_EMAIL || "";
+  const from = process.env.EMAIL_FROM || "Lypo <no-reply@lypo.org>";
+
+  if (!apiKey || !to) {
+    console.warn("⚠️ Support email not sent (missing RESEND_API_KEY or SUPPORT_EMAIL)");
+    return;
+  }
+
+  const subject = `🆕 New user signup: ${email}`;
+  const html = `
+    <div style="font-family:Arial,sans-serif;line-height:1.5">
+      <h2 style="margin:0 0 12px 0;">New user created</h2>
+      <p style="margin:0 0 8px 0;"><strong>Email:</strong> ${email}</p>
+      <p style="margin:0;color:#666;">Timestamp (UTC): ${new Date().toISOString()}</p>
+    </div>
+  `;
+
+  const resp = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ from, to, subject, html })
+  });
+
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => "");
+    console.error("❌ Resend error:", resp.status, txt);
+  }
+}
+
 const app = express();
 
 /* ---------------------------
@@ -301,6 +344,10 @@ app.post("/api/auth/signup", asyncHandler(async (req, res) => {
 
   const passwordHash = await bcrypt.hash(String(password), 10);
   const row = await createUser(e, passwordHash);
+  
+  // Notify support (non-blocking)
+  Promise.resolve(sendSupportNewUserEmail({ email: e })).catch((err) => console.error("Support email failed:", err));
+
   res.json({ token: signToken(e), user: publicUserRow(row) });
 }));
 
