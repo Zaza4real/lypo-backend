@@ -42,6 +42,10 @@ import bcrypt from "bcryptjs";
 import pg from "pg";
 import { Resend } from "resend";
 
+// Resend email client (safe init)
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+
+
 
 // asyncHandler helper (prevents unhandled promise rejections in routes)
 const asyncHandler = (fn) => (req, res, next) =>
@@ -77,9 +81,6 @@ const allowedOrigins = new Set([
   "https://www.lypo.org",
   process.env.FRONTEND_URL || ""
 ].filter(Boolean));
-const resend = new Resend(process.env.RESEND_API_KEY || "");
-
-
 const CORS_ALLOW_ALL = process.env.CORS_ALLOW_ALL === "1";
 
 app.use((req, res, next) => {
@@ -108,7 +109,6 @@ const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
 const JWT_SECRET = process.env.JWT_SECRET || "dev_change_me";
 
 // ---- Resend (Support emails)
-let resend = null;
 if (process.env.RESEND_API_KEY) {
   try {
     resend = new Resend(process.env.RESEND_API_KEY);
