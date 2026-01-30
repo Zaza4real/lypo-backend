@@ -187,6 +187,13 @@ async function addBalance(email, delta, reason) {
   return { ok: true, balance: Number(rows[0].balance || 0) };
 }
 
+
+async function getBalance(email) {
+  const e = normEmail(email);
+  const { rows } = await pool.query("SELECT balance FROM users WHERE email=$1", [e]);
+  return rows[0] ? Number(rows[0].balance || 0) : 0;
+}
+
 async function chargeBalance(email, cost) {
   const e = normEmail(email);
   const c = Math.max(0, Math.trunc(cost));
@@ -432,7 +439,7 @@ app.get("/api/stripe/confirm", auth, asyncHandler(async (req, res) => {
   if (!sessionId) return res.status(400).json({ error: "Missing session_id" });
 
   // Retrieve the session from Stripe
-  const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ["payment_intent", "payment_intent.charges"] });
+  const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ["payment_intent", "payment_intent.charges", "payment_intent.latest_charge"] });
 
   // Must belong to the logged-in user
   const email = req.user.email;
@@ -461,14 +468,25 @@ app.get("/api/stripe/confirm", auth, asyncHandler(async (req, res) => {
       invoiceUrl = inv.invoice_pdf || inv.hosted_invoice_url || null;
     } else {
       const pi = session.payment_intent;
-      const charge = pi?.charges?.data?.[0];
-      invoiceUrl = charge?.receipt_url || null;
+const charge = pi?.charges?.data?.[0];
+invoiceUrl = charge?.receipt_url || null;
+
+// Fallback: retrieve latest_charge if charges list isn't present
+if (!invoiceUrl && pi?.latest_charge) {
+  try {
+    const ch = await stripe.charges.retrieve(
+      typeof pi.latest_charge === "string" ? pi.latest_charge : pi.latest_charge.id
+    );
+    invoiceUrl = ch?.receipt_url || invoiceUrl;
+  } catch {}
+}
     }
   } catch {
     invoiceUrl = null;
   }
 
   // Record payment + credit balance (idempotent because stripe_session_id is UNIQUE)
+  let balRes = null;
   try {
     await recordPayment({
       email,
@@ -478,16 +496,16 @@ app.get("/api/stripe/confirm", auth, asyncHandler(async (req, res) => {
       status: "completed",
       invoiceUrl
     });
-    await addBalance(email, credits);
-  } catch (e) {
-    // If already recorded, ignore; still return current balance
-    const msg = String(e?.message || "");
-    if (!msg.toLowerCase().includes("duplicate") && !msg.toLowerCase().includes("unique")) {
-      console.log("⚠️ confirm payment failed:", msg);
-    }
+    balRes = await addBalance(email, credits);
+} catch (e) {
+  // If already recorded, ignore; still return current balance
+  const msg = String(e?.message || "");
+  if (!msg.toLowerCase().includes("duplicate") && !msg.toLowerCase().includes("unique")) {
+    console.log("⚠️ confirm payment failed:", msg);
   }
+}
 
-  const bal = await getBalance(email);
+const bal = (balRes && balRes.ok) ? balRes.balance : await getBalance(email);
   res.json({ ok: true, balance: bal, invoice_url: invoiceUrl });
 }));
 
