@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Post • LYPO</title>
+  <meta name="description" content="LYPO blog post." />
+  <link rel="stylesheet" href="style.css" />
+</head>
+
+<body>
+  <div class="bg">
+    <div class="orb o1"></div>
+    <div class="orb o2"></div>
+    <div class="grid"></div>
+    <div class="noise"></div>
+  </div>
+
+  <header class="header">
+    <a class="logoWrap" href="#" aria-label="LYPO Home" data-go="home">
+      <span class="logo">LYPO<span class="logoTagline">Sounds like magic…</span></span>
+    </a>
+
+    <nav class="tabs" role="tablist" aria-label="LYPO tabs">
+      <button class="tabBtn isActive" role="tab" aria-selected="true" data-tab="home" type="button">Demo</button>
+      <button class="tabBtn" role="tab" aria-selected="false" data-href="features.html" type="button">Features</button>
+      <button class="tabBtn" role="tab" aria-selected="false" data-href="support.html" type="button">Support</button>
+      <button class="tabBtn" role="tab" aria-selected="false" data-href="blog.html" type="button">Blog</button>
+      <button class="tabBtn" role="tab" aria-selected="false" data-href="about.html" type="button">About</button>
+    </nav>
+
+    <div class="headerRight">
+      <button class="btnPrimary headerAuthBtn" id="headerAuth" data-auth-page="1" type="button">
+        <span class="btnLabel" id="headerAuthLabel">Login</span>
+        <span class="btnGlow"></span>
+      </button>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="panel postContainer">
+      <div class="actions" style="margin-bottom: 12px;">
+        <button class="btnGhost" type="button" onclick="location.href='blog.html'">
+          <span class="btnLabel">← Back to Blog</span><span class="btnGlow"></span>
+        </button>
+      </div>
+
+      <div class="card postCard" style="padding: 16px;">
+        <h2 id="postTitle" style="margin:0;">Loading…</h2>
+        <div class="muted" id="postMeta" style="margin-top: 6px;"></div>
+
+        <div id="postMedia" style="margin-top: 12px;"></div>
+
+        <div class="divider" style="margin: 14px 0;"></div>
+
+        <div id="postBody" class="postBody"></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="post.js" defer></script>
+  <script src="header.js" defer></script>
+</body>
+</html>

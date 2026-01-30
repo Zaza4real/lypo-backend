@@ -77,6 +77,8 @@ const allowedOrigins = new Set([
   "https://www.lypo.org",
   process.env.FRONTEND_URL || ""
 ].filter(Boolean));
+const resend = new Resend(process.env.RESEND_API_KEY || "");
+
 
 const CORS_ALLOW_ALL = process.env.CORS_ALLOW_ALL === "1";
 
@@ -116,6 +118,40 @@ if (process.env.RESEND_API_KEY) {
 }
 const EMAIL_FROM = process.env.EMAIL_FROM || "LYPO <no-reply@lypo.org>";
 const SUPPORT_TO = process.env.SUPPORT_TO || process.env.SUPPORT_EMAIL || process.env.ADMIN_EMAIL || "";
+
+
+
+async function sendEmailVerification({ email, token }) {
+  const apiKey = (process.env.RESEND_API_KEY || "").trim();
+  const from = (process.env.RESEND_FROM || "support@lypo.org").trim();
+  if (!apiKey) {
+    console.log("🔑 Email verify link (Resend not configured):", `${FRONTEND_URL}/auth.html#verify=${token}&email=${encodeURIComponent(email)}`);
+    return;
+  }
+
+  const verifyUrl = `${FRONTEND_URL}/auth.html#verify=${token}&email=${encodeURIComponent(email)}`;
+
+  await resend.emails.send({
+    from,
+    to: email,
+    subject: "Welcome to LYPO — confirm your email",
+    html: `
+      <div style="font-family: Arial, Helvetica, sans-serif; line-height: 1.5; color: #111;">
+        <h2 style="margin:0 0 8px 0;">Welcome to LYPO 👋</h2>
+        <p style="margin:0 0 14px 0;">Please confirm your email to activate your account.</p>
+        <p style="margin:0 0 18px 0;">
+          <a href="${verifyUrl}" style="display:inline-block; padding:10px 14px; background:#111; color:#fff; text-decoration:none; border-radius:10px;">
+            Confirm email
+          </a>
+        </p>
+        <p style="margin:0; font-size:12px; color:#444;">If the button doesn't work, open this link:</p>
+        <p style="margin:6px 0 0 0; font-size:12px; color:#444;">${verifyUrl}</p>
+      </div>
+    `,
+  });
+
+  console.log("📩 Verification email sent to:", email);
+}
 
 async function sendSupportEmail({ fromEmail, subject, message, authedEmail }) {
   const to = SUPPORT_TO;
@@ -198,7 +234,15 @@ async function initDb() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;
   `);
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS payments (
+    
+CREATE TABLE IF NOT EXISTS email_verifications (
+  token TEXT PRIMARY KEY,
+  email TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  used_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS payments (
       id BIGSERIAL PRIMARY KEY,
       email TEXT NOT NULL,
       stripe_session_id TEXT UNIQUE,
@@ -513,6 +557,23 @@ app.post("/api/auth/signup", async (req, res) => {
 
   res.json({ token: signToken(e, row?.is_admin), user: publicUserRow(row) });
 });
+
+
+
+app.post("/api/auth/verify-email", asyncHandler(async (req, res) => {
+  const email = normEmail(String(req.body.email || ""));
+  const token = String(req.body.token || "").trim();
+  if (!email || !token) return res.status(400).json({ error: "Missing email or token" });
+
+  const row = (await pool.query("SELECT token, email, used_at FROM email_verifications WHERE token=$1 AND email=$2", [token, email])).rows[0];
+  if (!row) return res.status(400).json({ error: "Invalid token" });
+  if (row.used_at) return res.status(400).json({ error: "Token already used" });
+
+  await pool.query("UPDATE email_verifications SET used_at=NOW() WHERE token=$1", [token]);
+  await pool.query("UPDATE users SET is_verified=TRUE WHERE email=$1", [email]);
+
+  res.json({ ok: true });
+}));
 
 app.post("/api/auth/login", async (req, res) => {
   const { email, password } = req.body || {};
