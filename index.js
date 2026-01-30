@@ -20,6 +20,8 @@ const app = express();
    CORS
 ---------------------------- */
 const allowedOrigins = new Set([
+  "https://lypo.org",
+  "https://www.lypo.org",
   "https://digitalgeekworld.com",
   "https://www.digitalgeekworld.com",
   "https://homepage-3d78.onrender.com",
@@ -34,6 +36,7 @@ app.use((req, res, next) => {
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
   res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Credentials", "true");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   if (req.method === "OPTIONS") return res.sendStatus(204);
@@ -231,7 +234,7 @@ function auth(req, res, next) {
 }
 
 // Stripe webhook must use RAW body — define BEFORE express.json
-app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), asyncHandler(async (req, res) => {
   const sig = req.headers["stripe-signature"];
   let event;
   try {
@@ -274,13 +277,13 @@ try {
   }
 
   res.json({ received: true });
-});
+}));
 
 // JSON for normal routes
 app.use(express.json({ limit: "2mb" }));
 
 // ---- Auth routes
-app.post("/api/auth/signup", async (req, res) => {
+app.post("/api/auth/signup", asyncHandler(async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: "Missing email/password" });
   if (String(password).length < 6) return res.status(400).json({ error: "Password too short (min 6)" });
@@ -292,9 +295,9 @@ app.post("/api/auth/signup", async (req, res) => {
   const passwordHash = await bcrypt.hash(String(password), 10);
   const row = await createUser(e, passwordHash);
   res.json({ token: signToken(e), user: publicUserRow(row) });
-});
+}));
 
-app.post("/api/auth/login", async (req, res) => {
+app.post("/api/auth/login", asyncHandler(async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: "Missing email/password" });
 
@@ -306,14 +309,14 @@ app.post("/api/auth/login", async (req, res) => {
   if (!ok) return res.status(401).json({ error: "Invalid credentials" });
 
   res.json({ token: signToken(e), user: publicUserRow(u) });
-});
+}));
 
-app.get("/api/auth/me", auth, async (req, res) => {
+app.get("/api/auth/me", auth, asyncHandler(async (req, res) => {
   const email = req.user?.email;
   const u = await getUserByEmail(email);
   if (!u) return res.status(401).json({ error: "Invalid user" });
   res.json({ user: publicUserRow(u) });
-});
+}));
 
 // ---- Credits
 
@@ -331,11 +334,11 @@ function isAdminEmail(email) {
   return admins.has(String(email).toLowerCase());
 }
 
-app.get("/api/admin/status", auth, async (req, res) => {
+app.get("/api/admin/status", auth, asyncHandler(async (req, res) => {
   return res.json({ isAdmin: isAdminEmail(req.user?.email), email: req.user?.email || null });
-});
+}));
 
-app.post("/api/admin/add-credits", auth, async (req, res) => {
+app.post("/api/admin/add-credits", auth, asyncHandler(async (req, res) => {
   if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
 
   const email = String(req.body?.email || "").trim().toLowerCase();
@@ -349,16 +352,16 @@ app.post("/api/admin/add-credits", auth, async (req, res) => {
   if (!out.ok) return res.status(400).json({ error: out.code || "FAILED" });
 
   return res.json({ ok: true, user: { email, balance: out.balance } });
-});
+}));
 
-app.get("/api/credits", auth, async (req, res) => {
+app.get("/api/credits", auth, asyncHandler(async (req, res) => {
   const email = req.user.email;
   const u = await getUserByEmail(email);
   if (!u) return res.status(401).json({ error: "Invalid user" });
   res.json({ balance: Number(u.balance || 0) });
-});
+}));
 
-app.post("/api/credits/charge", auth, async (req, res) => {
+app.post("/api/credits/charge", auth, asyncHandler(async (req, res) => {
   const email = req.user.email;
   const seconds = Number(req.body?.seconds || 0);
   const s = Math.max(1, Math.ceil(seconds));
@@ -370,31 +373,31 @@ app.post("/api/credits/charge", auth, async (req, res) => {
     return res.status(402).json({ error: "INSUFFICIENT_CREDITS", required: cost, balance: result.balance });
   }
   res.json({ charged: cost, remaining: result.balance });
-});
+}));
 
 
 // ---- Account dashboard
-app.get("/api/account/payments", auth, async (req, res) => {
+app.get("/api/account/payments", auth, asyncHandler(async (req, res) => {
   const email = normEmail(req.user.email);
   const { rows } = await pool.query(
     "SELECT stripe_session_id, amount_usd, lypos, status, invoice_url, created_at FROM payments WHERE email=$1 ORDER BY created_at DESC LIMIT 100",
     [email]
   );
   res.json({ payments: rows });
-});
+}));
 
-app.get("/api/account/videos", auth, async (req, res) => {
+app.get("/api/account/videos", auth, asyncHandler(async (req, res) => {
   const email = normEmail(req.user.email);
   const { rows } = await pool.query(
     "SELECT prediction_id, status, input_url, output_url, created_at FROM videos WHERE email=$1 ORDER BY created_at DESC LIMIT 100",
     [email]
   );
   res.json({ videos: rows });
-});
+}));
 
 
 // ---- Stripe checkout: buy LYPOS
-app.post("/api/stripe/create-checkout-session", auth, async (req, res) => {
+app.post("/api/stripe/create-checkout-session", auth, asyncHandler(async (req, res) => {
   const usd = Number(req.body?.usd || 0);
   if (!Number.isFinite(usd) || usd <= 0) return res.status(400).json({ error: "Invalid usd" });
 
@@ -420,11 +423,11 @@ app.post("/api/stripe/create-checkout-session", auth, async (req, res) => {
   });
 
   res.json({ url: session.url });
-});
+}));
 
 // Confirm Checkout Session on return (fallback if webhook is not configured)
 // Idempotent: will not double-credit if already recorded.
-app.get("/api/stripe/confirm", auth, async (req, res) => {
+app.get("/api/stripe/confirm", auth, asyncHandler(async (req, res) => {
   const sessionId = String(req.query?.session_id || "").trim();
   if (!sessionId) return res.status(400).json({ error: "Missing session_id" });
 
@@ -486,7 +489,7 @@ app.get("/api/stripe/confirm", auth, async (req, res) => {
 
   const bal = await getBalance(email);
   res.json({ ok: true, balance: bal, invoice_url: invoiceUrl });
-});
+}));
 
 /* ---------------------------
    ENV
@@ -670,7 +673,7 @@ app.post("/api/dub-upload", auth, (req, res) => {
 /**
  * GET /api/dub/:id
  */
-app.get("/api/dub/:id", auth, async (req, res) => {
+app.get("/api/dub/:id", auth, asyncHandler(async (req, res) => {
   try {
     requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
 
@@ -711,7 +714,7 @@ app.get("/api/dub/:id", auth, async (req, res) => {
     console.error(e);
     res.status(500).json({ error: e?.message || "Internal error" });
   }
-});
+}));
 
 const PORT = process.env.PORT || 3000;
 
@@ -847,3 +850,21 @@ app.delete("/api/admin/user-delete", auth, asyncHandler(async (req, res) => {
   res.json({ ok: true });
 }));
 
+
+/* ---------------------------
+   ERROR HANDLER
+---------------------------- */
+app.use((err, req, res, next) => {
+  console.error("🔥 Unhandled error:", err);
+  // If CORS middleware did not run (rare), try to set origin header anyway
+  const origin = req.headers.origin;
+  if (origin && (CORS_ALLOW_ALL || allowedOrigins.has(origin))) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+    res.setHeader("Vary", "Origin");
+  }
+  res.status(err.statusCode || 500).json({
+    error: "SERVER_ERROR",
+    message: err.message || "Unknown error"
+  });
+});
