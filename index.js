@@ -1,3 +1,36 @@
+
+async function recordPaymentFromSessionIfMissing(sessionId, email) {
+  try {
+    const existing = await pool.query(
+      "SELECT 1 FROM payments WHERE stripe_session_id=$1 LIMIT 1",
+      [sessionId]
+    );
+    if (existing.rows.length) return;
+
+    const session = await stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ["payment_intent", "line_items"]
+    });
+
+    if (session.payment_status !== "paid") return;
+
+    const amountUsd = (session.amount_total || 0) / 100;
+    const credits = Math.round(amountUsd * 100); // same logic you already use
+    const invoiceUrl = await resolveInvoiceUrlFromSession(session);
+
+    await pool.query(
+      `INSERT INTO payments (email, stripe_session_id, amount_usd, lypos, status, invoice_url)
+       VALUES ($1,$2,$3,$4,'paid',$5)`,
+      [email, sessionId, amountUsd, credits, invoiceUrl]
+    );
+
+    await pool.query(
+      "UPDATE users SET balance = balance + $1 WHERE email=$2",
+      [credits, email]
+    );
+  } catch (e) {
+    console.error("recordPaymentFromSessionIfMissing failed:", e.message);
+  }
+}
 import express from "express";
 import Replicate from "replicate";
 import Busboy from "busboy";
@@ -529,28 +562,24 @@ app.post("/api/credits/charge", auth, async (req, res) => {
 // ---- Account dashboard
 app.get("/api/account/payments", auth, async (req, res) => {
   const email = normEmail(req.user.email);
+
+  // Recover missed Stripe payments
+  try {
+    const sessions = await stripe.checkout.sessions.list({
+      limit: 5,
+      customer_email: email
+    });
+    for (const s of sessions.data) {
+      if (s.payment_status === "paid") {
+        await recordPaymentFromSessionIfMissing(s.id, email);
+      }
+    }
+  } catch (e) {}
+
   const { rows } = await pool.query(
     "SELECT stripe_session_id, amount_usd, lypos, status, invoice_url, created_at FROM payments WHERE email=$1 ORDER BY created_at DESC LIMIT 100",
     [email]
   );
-
-  // Backfill missing invoice/receipt URLs (helps when webhooks aren't configured or invoices are created later)
-  try {
-    const missing = rows.filter(r => r.stripe_session_id && !r.invoice_url).slice(0, 5);
-    for (const p of missing) {
-      const url = await resolveInvoiceUrlBySessionId(p.stripe_session_id);
-      if (url) {
-        await pool.query(
-          "UPDATE payments SET invoice_url=$1 WHERE stripe_session_id=$2",
-          [url, p.stripe_session_id]
-        );
-        p.invoice_url = url;
-      }
-    }
-  } catch (e) {
-    // ignore backfill errors; still return payments list
-  }
-
   res.json({ payments: rows });
 });
 
@@ -567,6 +596,7 @@ app.get("/api/account/videos", auth, async (req, res) => {
 
 // ---- Stripe checkout: buy LYPOS
 app.post("/api/stripe/create-checkout-session", auth, async (req, res) => {
+  const frontendBase = (process.env.FRONTEND_URL || "").trim() || (req.headers.origin || "").trim() || (FRONTEND_URL || "").trim();
   const usd = Number(req.body?.usd || 0);
   if (!Number.isFinite(usd) || usd <= 0) return res.status(400).json({ error: "Invalid usd" });
 
@@ -587,9 +617,8 @@ app.post("/api/stripe/create-checkout-session", auth, async (req, res) => {
       }
     ],
     metadata: { email, lypos: String(lypos) },
-    success_url: `${FRONTEND_URL}/dashboard.html?paid=1&session_id={CHECKOUT_SESSION_ID}`,
-    cancel_url: `${FRONTEND_URL}/dashboard.html?paid=0`
-  });
+    success_url: `${frontendBase}/dashboard.html?paid=1&session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${frontendBase}/dashboard.html?paid=0`});
 
   res.json({ url: session.url });
 });
