@@ -8,6 +8,14 @@ import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import pg from "pg";
 
+
+// async wrapper for express routes (prevents unhandled promise rejections)
+function asyncHandler(fn) {
+  return function (req, res, next) {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+}
+
 const app = express();
 
 /* ---------------------------
