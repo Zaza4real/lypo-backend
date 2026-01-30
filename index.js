@@ -150,6 +150,36 @@ async function sendNewUserNotification(email) {
   }
 }
 
+
+
+async function sendPasswordResetEmail({ email, token }) {
+  const from = process.env.RESEND_FROM || process.env.SUPPORT_EMAIL || "support@lypo.org";
+  const resetUrl = `${FRONTEND_URL}/auth.html#reset=${token}&email=${encodeURIComponent(email)}`;
+
+  if (!resend) {
+    console.log("🔑 Password reset link (email disabled):", resetUrl);
+    return;
+  }
+
+  await resend.emails.send({
+    from,
+    to: email,
+    subject: "Reset your LYPO password",
+    html: `
+      <div style="font-family:Arial,Helvetica,sans-serif;line-height:1.5">
+        <h2>Password reset</h2>
+        <p>You requested a password reset for your LYPO account.</p>
+        <p>
+          <a href="${resetUrl}" style="display:inline-block;padding:10px 14px;background:#111;color:#fff;text-decoration:none;border-radius:10px">
+            Reset password
+          </a>
+        </p>
+        <p style="font-size:12px;color:#555">If you did not request this, you can safely ignore this email.</p>
+      </div>
+    `
+  });
+}
+
 async function sendEmailVerification({ email, token }) {
   const apiKey = (process.env.RESEND_API_KEY || "").trim();
   const from = (process.env.RESEND_FROM || "support@lypo.org").trim();
