@@ -121,6 +121,35 @@ const SUPPORT_TO = process.env.SUPPORT_TO || process.env.SUPPORT_EMAIL || proces
 
 
 
+
+
+async function sendNewUserNotification(email) {
+  const apiKey = (process.env.RESEND_API_KEY || "").trim();
+  const supportTo = (process.env.SUPPORT_EMAIL || process.env.RESEND_FROM || "").trim();
+  if (!apiKey || !supportTo || !resend) {
+    console.log("👤 New user registered:", email);
+    return;
+  }
+
+  try {
+    await resend.emails.send({
+      from: process.env.RESEND_FROM || supportTo,
+      to: supportTo,
+      subject: "New LYPO user registered",
+      html: `
+        <div style="font-family:Arial,Helvetica,sans-serif">
+          <h3>New user signup</h3>
+          <p><b>Email:</b> ${email}</p>
+          <p><b>Time:</b> ${new Date().toLocaleString()}</p>
+        </div>
+      `
+    });
+    console.log("📩 Support notified about new user:", email);
+  } catch (e) {
+    console.log("Support notify failed:", e?.message || e);
+  }
+}
+
 async function sendEmailVerification({ email, token }) {
   const apiKey = (process.env.RESEND_API_KEY || "").trim();
   const from = (process.env.RESEND_FROM || "support@lypo.org").trim();
