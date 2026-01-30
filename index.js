@@ -42,6 +42,12 @@ import bcrypt from "bcryptjs";
 import pg from "pg";
 import { Resend } from "resend";
 
+
+// asyncHandler helper (prevents unhandled promise rejections in routes)
+const asyncHandler = (fn) => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
+
+
 const app = express();
 
 function requireAdmin(req, res, next) {
