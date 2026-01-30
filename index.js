@@ -120,22 +120,23 @@ async function initDb() {
       balance INTEGER NOT NULL DEFAULT 0,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
-  
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS blog_posts (
-        id SERIAL PRIMARY KEY,
-        title TEXT NOT NULL,
-        slug TEXT UNIQUE NOT NULL,
-        excerpt TEXT DEFAULT '',
-        cover_url TEXT DEFAULT '',
-        video_url TEXT DEFAULT '',
-        content_html TEXT DEFAULT '',
-        status TEXT DEFAULT 'draft',
-        created_at TIMESTAMP DEFAULT NOW(),
-        updated_at TIMESTAMP DEFAULT NOW()
-      );
-    `);
-`);
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS blog_posts (
+      id SERIAL PRIMARY KEY,
+      title TEXT NOT NULL,
+      slug TEXT UNIQUE NOT NULL,
+      excerpt TEXT DEFAULT '',
+      cover_url TEXT DEFAULT '',
+      video_url TEXT DEFAULT '',
+      content_html TEXT DEFAULT '',
+      status TEXT DEFAULT 'draft',
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS payments (
       id BIGSERIAL PRIMARY KEY,
