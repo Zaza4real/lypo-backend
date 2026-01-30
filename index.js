@@ -52,6 +52,18 @@ const asyncHandler = (fn) => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch(next);
 
 
+
+
+// --- EMAIL DIAGNOSTICS ---
+console.log("📧 Email config:",
+  JSON.stringify({
+    hasResendKey: !!(process.env.RESEND_API_KEY && String(process.env.RESEND_API_KEY).trim()),
+    resendFrom: process.env.RESEND_FROM || null,
+    supportEmail: process.env.SUPPORT_EMAIL || null,
+    frontendUrl: process.env.FRONTEND_URL || null
+  })
+);
+// -------------------------
 const app = express();
 
 function requireAdmin(req, res, next) {
@@ -133,7 +145,7 @@ async function sendNewUserNotification(email) {
 
   try {
     await resend.emails.send({
-      from: process.env.RESEND_FROM || supportTo,
+      from: (process.env.RESEND_FROM || "onboarding@resend.dev"),
       to: supportTo,
       subject: "New LYPO user registered",
       html: `
@@ -146,7 +158,8 @@ async function sendNewUserNotification(email) {
     });
     console.log("📩 Support notified about new user:", email);
   } catch (e) {
-    console.log("Support notify failed:", e?.message || e);
+    console.log("❌ Support notify failed:", e?.message || e);
+    console.log("Full error:", e);
   }
 }
 
@@ -157,7 +170,7 @@ async function sendNewUserNotification(email) {
 
 async function sendPasswordResetEmail({ email, token }) {
   const resetUrl = `${FRONTEND_URL}/auth.html#reset=${token}&email=${encodeURIComponent(email)}`;
-  const from = (process.env.RESEND_FROM || process.env.SUPPORT_EMAIL || "support@lypo.org").trim();
+  const from = (process.env.RESEND_FROM || "onboarding@resend.dev").trim();
 
   if (!resend) {
     console.log("🔑 Password reset link (Resend not configured):", resetUrl);
@@ -187,6 +200,7 @@ async function sendPasswordResetEmail({ email, token }) {
     return true;
   } catch (e) {
     console.log("❌ Password reset email failed:", e?.message || e);
+    console.log("Full error:", e);
     console.log("🔑 Password reset link (fallback):", resetUrl);
     return false;
   }
@@ -194,7 +208,7 @@ async function sendPasswordResetEmail({ email, token }) {
 
 async function sendEmailVerification({ email, token }) {
   const apiKey = (process.env.RESEND_API_KEY || "").trim();
-  const from = (process.env.RESEND_FROM || "support@lypo.org").trim();
+  const from = (process.env.RESEND_FROM || "onboarding@resend.dev").trim();
   if (!apiKey) {
     console.log("🔑 Email verify link (Resend not configured):", `${FRONTEND_URL}/auth.html#verify=${token}&email=${encodeURIComponent(email)}`);
     return;
