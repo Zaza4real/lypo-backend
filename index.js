@@ -710,7 +710,7 @@ app.post("/api/auth/reset-password", asyncHandler(async (req, res) => {
   if (password.length < 6) return res.status(400).json({ error: "Password too short (min 6)" });
 
   const row = (await pool.query(
-    "SELECT token, email, created_at, used_at FROM password_resets WHERE token=$1 AND email=$2",
+    "SELECT token_hash, email, created_at, used_at, expires_at FROM password_resets WHERE token=$1 AND email=$2",
     [token, email]
   )).rows[0];
 
@@ -744,7 +744,7 @@ app.post("/api/auth/forgot-password", asyncHandler(async (req, res) => {
 
   // Insert using token_hash (your DB enforces NOT NULL on token_hash)
   await pool.query(
-    "INSERT INTO password_resets(token_hash, email) VALUES($1,$2)",
+    "INSERT INTO password_resets(token_hash, email, expires_at) VALUES($1,$2, NOW() + INTERVAL '2 hours')",
     [tokenHash, email]
   );
 
