@@ -9,10 +9,7 @@ import bcrypt from "bcryptjs";
 import pg from "pg";
 
 
-// async wrapper for express routes
-function asyncHandler(fn){
-  return (req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next);
-}
+function asyncHandler(fn){return (req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next);}
 
 const app = express();
 
@@ -35,7 +32,7 @@ app.use((req, res, next) => {
   }
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
@@ -101,22 +98,6 @@ async function initDb() {
   await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS cost_credits INTEGER NOT NULL DEFAULT 0;`);
   await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS refunded BOOLEAN NOT NULL DEFAULT false;`);
   await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS invoice_url TEXT;`);
-  // Blog posts
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS blog_posts (
-      id SERIAL PRIMARY KEY,
-      title TEXT NOT NULL,
-      slug TEXT NOT NULL UNIQUE,
-      excerpt TEXT DEFAULT '',
-      cover_url TEXT DEFAULT '',
-      video_url TEXT DEFAULT '',
-      content_html TEXT NOT NULL DEFAULT '',
-      status TEXT NOT NULL DEFAULT 'draft',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-
 }
 
 function normEmail(email) {
@@ -723,101 +704,43 @@ initDb()
     console.error("❌ DB init failed", e);
     process.exit(1);
   });
-// ---- Public blog
-app.get("/api/blog/posts", asyncHandler(async (req, res) => {
-  const rows = (await pool.query(
-    "SELECT id, title, slug, excerpt, cover_url, video_url, content_html, created_at, updated_at FROM blog_posts WHERE status='published' ORDER BY created_at DESC LIMIT 200"
-  )).rows;
-  res.json({ posts: rows });
-}));
 
-app.get("/api/blog/posts/:slug", asyncHandler(async (req, res) => {
-  const slug = String(req.params.slug || "").trim();
-  const row = (await pool.query(
-    "SELECT id, title, slug, excerpt, cover_url, video_url, content_html, created_at, updated_at FROM blog_posts WHERE status='published' AND slug=$1 LIMIT 1",
-    [slug]
-  )).rows[0];
-  if (!row) return res.status(404).json({ error: "NOT_FOUND" });
-  res.json({ post: row });
-}));
-
-// ---- Admin blog (requires admin)
-app.get("/api/admin/blog/posts", auth, asyncHandler(async (req, res) => {
+// ---- Admin: Update user (supports balance)
+app.put("/api/admin/user-update", auth, asyncHandler(async (req, res) => {
   if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
-  const rows = (await pool.query(
-    "SELECT id, title, slug, excerpt, cover_url, video_url, content_html, status, created_at, updated_at FROM blog_posts ORDER BY created_at DESC LIMIT 500"
-  )).rows;
-  res.json({ posts: rows });
+
+  const email = normEmail(String(req.body?.email || ""));
+  const balanceRaw = req.body?.balance;
+  if (!email) return res.status(400).json({ error: "MISSING_EMAIL" });
+  if (balanceRaw === undefined || balanceRaw === null || balanceRaw === "") return res.status(400).json({ error: "MISSING_BALANCE" });
+
+  const balance = Number(balanceRaw);
+  if (!Number.isFinite(balance) || balance < 0) return res.status(400).json({ error: "INVALID_BALANCE" });
+
+  const u = await getUserByEmail(email);
+  if (!u) return res.status(404).json({ error: "USER_NOT_FOUND" });
+
+  await pool.query("UPDATE users SET balance=$1 WHERE email=$2", [Math.floor(balance), email]);
+  const updated = await getUserByEmail(email);
+  res.json({ ok: true, user: { email: updated.email, balance: Number(updated.balance||0), created_at: updated.created_at, is_admin: isAdminEmail(updated.email) } });
 }));
 
-app.post("/api/admin/blog/posts", auth, asyncHandler(async (req, res) => {
+// ---- Admin: Delete user account (and related history)
+app.delete("/api/admin/user-delete", auth, asyncHandler(async (req, res) => {
   if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
-  const title = String(req.body?.title || "").trim();
-  const slug = String(req.body?.slug || "").trim();
-  const excerpt = String(req.body?.excerpt || "");
-  const cover_url = String(req.body?.cover_url || "");
-  const video_url = String(req.body?.video_url || "");
-  const content_html = String(req.body?.content_html || "");
-  const status = String(req.body?.status || "draft");
-  if (!title || !slug) return res.status(400).json({ error: "MISSING_FIELDS" });
 
-  const row = (await pool.query(
-    "INSERT INTO blog_posts (title, slug, excerpt, cover_url, video_url, content_html, status) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *",
-    [title, slug, excerpt, cover_url, video_url, content_html, status]
-  )).rows[0];
-  res.json({ post: row });
-}));
+  const email = normEmail(String(req.query?.email || req.body?.email || ""));
+  if (!email) return res.status(400).json({ error: "MISSING_EMAIL" });
 
-app.put("/api/admin/blog/posts/:id", auth, asyncHandler(async (req, res) => {
-  if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: "BAD_ID" });
+  const u = await getUserByEmail(email);
+  if (!u) return res.status(404).json({ error: "USER_NOT_FOUND" });
 
-  const title = String(req.body?.title || "").trim();
-  const slug = String(req.body?.slug || "").trim();
-  const excerpt = String(req.body?.excerpt || "");
-  const cover_url = String(req.body?.cover_url || "");
-  const video_url = String(req.body?.video_url || "");
-  const content_html = String(req.body?.content_html || "");
-  const status = String(req.body?.status || "draft");
-  if (!title || !slug) return res.status(400).json({ error: "MISSING_FIELDS" });
+  try { await pool.query("DELETE FROM videos WHERE email=$1", [email]); } catch {}
+  try { await pool.query("DELETE FROM payments WHERE email=$1", [email]); } catch {}
+  try { await pool.query("DELETE FROM password_resets WHERE email=$1", [email]); } catch {}
+  try { await pool.query("DELETE FROM blog_posts WHERE author_email=$1", [email]); } catch {}
 
-  const row = (await pool.query(
-    "UPDATE blog_posts SET title=$1, slug=$2, excerpt=$3, cover_url=$4, video_url=$5, content_html=$6, status=$7, updated_at=NOW() WHERE id=$8 RETURNING *",
-    [title, slug, excerpt, cover_url, video_url, content_html, status, id]
-  )).rows[0];
-  if (!row) return res.status(404).json({ error: "NOT_FOUND" });
-  res.json({ post: row });
-}));
-
-app.delete("/api/admin/blog/posts/:id", auth, asyncHandler(async (req, res) => {
-  if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: "BAD_ID" });
-  await pool.query("DELETE FROM blog_posts WHERE id=$1", [id]);
+  await pool.query("DELETE FROM users WHERE email=$1", [email]);
   res.json({ ok: true });
-}));
-
-
-// ---- Admin: list users
-app.get("/api/admin/users", auth, asyncHandler(async (req, res) => {
-  if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
-
-  const limit = Math.min(Math.max(parseInt(req.query?.limit || "50", 10) || 50, 1), 200);
-  const offset = Math.max(parseInt(req.query?.offset || "0", 10) || 0, 0);
-  const q = String(req.query?.q || "").trim();
-
-  const sqlBase = "SELECT email, balance, created_at FROM users";
-  const sqlWhere = q ? " WHERE email ILIKE $1" : "";
-  const sqlOrder = " ORDER BY created_at DESC";
-  const sqlLimit = q ? " LIMIT $2 OFFSET $3" : " LIMIT $1 OFFSET $2";
-  const params = q ? [`%${q}%`, limit, offset] : [limit, offset];
-
-  const rows = (await pool.query(sqlBase + sqlWhere + sqlOrder + sqlLimit, params)).rows;
-
-  res.json({
-    users: rows.map(u => ({ email: u.email, balance: Number(u.balance || 0), created_at: u.created_at, is_admin: isAdminEmail(u.email) })),
-    limit, offset, q
-  });
 }));
 
