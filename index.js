@@ -32,7 +32,7 @@ app.use((req, res, next) => {
   }
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
@@ -149,7 +149,23 @@ async function initDb() {
   `);
 
   
+  
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS blog_posts (
+      id BIGSERIAL PRIMARY KEY,
+      title TEXT NOT NULL,
+      slug TEXT NOT NULL UNIQUE,
+      excerpt TEXT,
+      cover_url TEXT,
+      video_url TEXT,
+      content_html TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'draft',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
+await pool.query(`
     CREATE TABLE IF NOT EXISTS password_resets (
       token_hash TEXT PRIMARY KEY,
       email TEXT NOT NULL,
@@ -602,6 +618,106 @@ app.get("/api/admin/user-lookup", auth, asyncHandler(async (req, res) => {
     videos
   });
 }));
+
+// ---- Blog (public)
+app.get("/api/blog/posts", asyncHandler(async (req, res) => {
+  const { rows } = await pool.query(
+    "SELECT id, title, slug, excerpt, cover_url, video_url, status, created_at FROM blog_posts WHERE status='published' ORDER BY created_at DESC LIMIT 200"
+  );
+  res.json({ posts: rows });
+}));
+
+app.get("/api/blog/posts/:slug", asyncHandler(async (req, res) => {
+  const slug = String(req.params.slug || "").trim();
+  if (!slug) return res.status(400).json({ error: "MISSING_SLUG" });
+  const { rows } = await pool.query(
+    "SELECT id, title, slug, excerpt, cover_url, video_url, content_html, status, created_at FROM blog_posts WHERE slug=$1 AND status='published' LIMIT 1",
+    [slug]
+  );
+  const post = rows[0];
+  if (!post) return res.status(404).json({ error: "NOT_FOUND" });
+  res.json({ post });
+}));
+
+// ---- Blog (admin)
+app.get("/api/admin/blog/posts", auth, asyncHandler(async (req, res) => {
+  if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
+  const { rows } = await pool.query(
+    "SELECT id, title, slug, excerpt, cover_url, video_url, status, created_at, updated_at FROM blog_posts ORDER BY created_at DESC LIMIT 500"
+  );
+  res.json({ posts: rows });
+}));
+
+app.get("/api/admin/blog/posts/:id", auth, asyncHandler(async (req, res) => {
+  if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
+  const id = Number(req.params.id || 0);
+  if (!id) return res.status(400).json({ error: "INVALID_ID" });
+  const { rows } = await pool.query(
+    "SELECT id, title, slug, excerpt, cover_url, video_url, content_html, status, created_at, updated_at FROM blog_posts WHERE id=$1 LIMIT 1",
+    [id]
+  );
+  const post = rows[0];
+  if (!post) return res.status(404).json({ error: "NOT_FOUND" });
+  res.json({ post });
+}));
+
+app.post("/api/admin/blog/posts", auth, asyncHandler(async (req, res) => {
+  if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
+
+  const title = String(req.body?.title || "").trim();
+  const slug = String(req.body?.slug || "").trim();
+  const excerpt = String(req.body?.excerpt || "").trim();
+  const cover_url = String(req.body?.cover_url || "").trim();
+  const video_url = String(req.body?.video_url || "").trim();
+  const content_html = String(req.body?.content_html || "").trim();
+  const status = (String(req.body?.status || "draft").trim() === "published") ? "published" : "draft";
+
+  if (!title || !slug || !content_html) return res.status(400).json({ error: "MISSING_FIELDS" });
+
+  const { rows } = await pool.query(
+    `INSERT INTO blog_posts (title, slug, excerpt, cover_url, video_url, content_html, status)
+     VALUES ($1,$2,$3,$4,$5,$6,$7)
+     RETURNING id, title, slug, status, created_at`,
+    [title, slug, excerpt || null, cover_url || null, video_url || null, content_html, status]
+  );
+  res.json({ ok: true, post: rows[0] });
+}));
+
+app.put("/api/admin/blog/posts/:id", auth, asyncHandler(async (req, res) => {
+  if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
+  const id = Number(req.params.id || 0);
+  if (!id) return res.status(400).json({ error: "INVALID_ID" });
+
+  const title = String(req.body?.title || "").trim();
+  const slug = String(req.body?.slug || "").trim();
+  const excerpt = String(req.body?.excerpt || "").trim();
+  const cover_url = String(req.body?.cover_url || "").trim();
+  const video_url = String(req.body?.video_url || "").trim();
+  const content_html = String(req.body?.content_html || "").trim();
+  const status = (String(req.body?.status || "draft").trim() === "published") ? "published" : "draft";
+
+  if (!title || !slug || !content_html) return res.status(400).json({ error: "MISSING_FIELDS" });
+
+  const { rows } = await pool.query(
+    `UPDATE blog_posts
+        SET title=$2, slug=$3, excerpt=$4, cover_url=$5, video_url=$6, content_html=$7, status=$8, updated_at=now()
+      WHERE id=$1
+      RETURNING id, title, slug, excerpt, cover_url, video_url, content_html, status, created_at, updated_at`,
+    [id, title, slug, excerpt || null, cover_url || null, video_url || null, content_html, status]
+  );
+  const post = rows[0];
+  if (!post) return res.status(404).json({ error: "NOT_FOUND" });
+  res.json({ ok: true, post });
+}));
+
+app.delete("/api/admin/blog/posts/:id", auth, asyncHandler(async (req, res) => {
+  if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
+  const id = Number(req.params.id || 0);
+  if (!id) return res.status(400).json({ error: "INVALID_ID" });
+  const del = await pool.query("DELETE FROM blog_posts WHERE id=$1", [id]);
+  res.json({ ok: true });
+}));
+
 
 app.get("/api/credits", auth, async (req, res) => {
   const email = req.user.email;
