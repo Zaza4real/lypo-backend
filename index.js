@@ -43,33 +43,15 @@ import pg from "pg";
 import { Resend } from "resend";
 
 // Resend email client (safe init)
-let resend = null;
-try {
-  const key = (process.env.RESEND_API_KEY || "").trim();
-  if (key) resend = new Resend(key);
-} catch (e) {
-  console.log("Resend init failed:", e?.message || e);
-}
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
 
-// Resend email client (safe init)
+
 // asyncHandler helper (prevents unhandled promise rejections in routes)
 const asyncHandler = (fn) => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch(next);
 
 
-
-
-// --- EMAIL DIAGNOSTICS ---
-console.log("📧 Email config:",
-  JSON.stringify({
-    hasResendKey: !!(process.env.RESEND_API_KEY && String(process.env.RESEND_API_KEY).trim()),
-    resendFrom: process.env.RESEND_FROM || null,
-    supportEmail: process.env.SUPPORT_EMAIL || null,
-    frontendUrl: process.env.FRONTEND_URL || null
-  })
-);
-// -------------------------
 const app = express();
 
 function requireAdmin(req, res, next) {
@@ -151,7 +133,7 @@ async function sendNewUserNotification(email) {
 
   try {
     await resend.emails.send({
-      from: (process.env.RESEND_FROM || "onboarding@resend.dev"),
+      from: process.env.RESEND_FROM || supportTo,
       to: supportTo,
       subject: "New LYPO user registered",
       html: `
@@ -164,57 +146,13 @@ async function sendNewUserNotification(email) {
     });
     console.log("📩 Support notified about new user:", email);
   } catch (e) {
-    console.log("❌ Support notify failed:", e?.message || e);
-    console.log("Full error:", e);
-  }
-}
-
-
-
-
-
-
-async function sendPasswordResetEmail({ email, token }) {
-  const resetUrl = `${FRONTEND_URL}/auth.html#reset=${token}&email=${encodeURIComponent(email)}`;
-  const from = (process.env.RESEND_FROM || "onboarding@resend.dev").trim();
-
-  if (!resend) {
-    console.log("🔑 Password reset link (Resend not configured):", resetUrl);
-    return false;
-  }
-
-  try {
-    await resend.emails.send({
-      from,
-      to: email,
-      subject: "Reset your LYPO password",
-      html: `
-        <div style="font-family:Arial,Helvetica,sans-serif;line-height:1.5;color:#111">
-          <h2 style="margin:0 0 8px 0;">Reset your password</h2>
-          <p style="margin:0 0 14px 0;">You requested a password reset for your LYPO account.</p>
-          <p style="margin:0 0 18px 0;">
-            <a href="${resetUrl}" style="display:inline-block;padding:10px 14px;background:#111;color:#fff;text-decoration:none;border-radius:10px;">
-              Reset password
-            </a>
-          </p>
-          <p style="margin:0;font-size:12px;color:#444;">If the button doesn't work, open this link:</p>
-          <p style="margin:6px 0 0 0;font-size:12px;color:#444;">${resetUrl}</p>
-        </div>
-      `
-    });
-    console.log("📩 Password reset email sent to:", email);
-    return true;
-  } catch (e) {
-    console.log("❌ Password reset email failed:", e?.message || e);
-    console.log("Full error:", e);
-    console.log("🔑 Password reset link (fallback):", resetUrl);
-    return false;
+    console.log("Support notify failed:", e?.message || e);
   }
 }
 
 async function sendEmailVerification({ email, token }) {
   const apiKey = (process.env.RESEND_API_KEY || "").trim();
-  const from = (process.env.RESEND_FROM || "onboarding@resend.dev").trim();
+  const from = (process.env.RESEND_FROM || "support@lypo.org").trim();
   if (!apiKey) {
     console.log("🔑 Email verify link (Resend not configured):", `${FRONTEND_URL}/auth.html#verify=${token}&email=${encodeURIComponent(email)}`);
     return;
@@ -320,14 +258,6 @@ async function initDb() {
       is_admin BOOLEAN NOT NULL DEFAULT FALSE,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
-
-CREATE TABLE IF NOT EXISTS password_resets (
-  token TEXT PRIMARY KEY,
-  email TEXT NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  used_at TIMESTAMPTZ
-);
-
   `);
   await pool.query(`
     ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;
@@ -371,17 +301,6 @@ CREATE TABLE IF NOT EXISTS payments (
   await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS cost_credits INTEGER NOT NULL DEFAULT 0;`);
   await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS refunded BOOLEAN NOT NULL DEFAULT false;`);
   await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS invoice_url TEXT;`);
-  // Migration: older deployments may have password_resets without expected columns
-  try {
-    await pool.query('ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS token_hash TEXT;');
-    await pool.query('ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS email TEXT;');
-    await pool.query('ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();');
-    await pool.query('ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS used_at TIMESTAMPTZ;');
-  } catch (e) {
-    // ignore (table may not exist yet)
-  }
-
-
 }
 
 function normEmail(email) {
@@ -698,61 +617,6 @@ app.post("/api/auth/login", async (req, res) => {
 
   res.json({ token: signToken(e, u?.is_admin), user: publicUserRow(u) });
 });
-
-
-
-app.post("/api/auth/reset-password", asyncHandler(async (req, res) => {
-  const email = normEmail((req.body && req.body.email) || "");
-  const token = String((req.body && req.body.token) || "").trim();
-  const password = String((req.body && req.body.password) || "");
-
-  if (!email || !token || !password) return res.status(400).json({ error: "Missing fields" });
-  if (password.length < 6) return res.status(400).json({ error: "Password too short (min 6)" });
-
-  const row = (await pool.query(
-    "SELECT token_hash, email, created_at, used_at, expires_at FROM password_resets WHERE token=$1 AND email=$2",
-    [token, email]
-  )).rows[0];
-
-  if (!row) return res.status(400).json({ error: "Invalid token" });
-  if (row.used_at) return res.status(400).json({ error: "Token already used" });
-
-  // Optional expiry: 2 hours
-  const createdAt = new Date(row.created_at);
-  if (Date.now() - createdAt.getTime() > 2 * 60 * 60 * 1000) {
-    return res.status(400).json({ error: "Token expired" });
-  }
-
-  const passwordHash = await bcrypt.hash(password, 10);
-  await pool.query("UPDATE users SET password_hash=$1 WHERE email=$2", [passwordHash, email]);
-  await pool.query("UPDATE password_resets SET used_at=now() WHERE token=$1", [token]);
-
-  res.json({ ok: true });
-}));
-
-
-app.post("/api/auth/forgot-password", asyncHandler(async (req, res) => {
-  const email = normEmail((req.body && req.body.email) || "");
-  if (!email) return res.json({ ok: true });
-
-  // Avoid account enumeration
-  const user = await getUserByEmail(email);
-  if (!user) return res.json({ ok: true });
-
-  const token = crypto.randomBytes(24).toString("hex");
-  const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
-
-  // Insert using token_hash (your DB enforces NOT NULL on token_hash)
-  await pool.query(
-    "INSERT INTO password_resets(token_hash, email, expires_at) VALUES($1,$2, NOW() + INTERVAL '2 hours')",
-    [tokenHash, email]
-  );
-
-  await sendPasswordResetEmail({ email, token });
-  res.json({ ok: true });
-}));
-
-
 
 app.get("/api/auth/me", auth, async (req, res) => {
   const email = req.user?.email;
@@ -1261,8 +1125,6 @@ const PORT = process.env.PORT || 3000;
 
 initDb()
   .then(() => {
-
-
     console.log("✅ DB ready");
     app.listen(PORT, () => console.log(`LYPO backend running on ${PORT}`));
   })
