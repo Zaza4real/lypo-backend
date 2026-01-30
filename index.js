@@ -101,6 +101,7 @@ async function initDb() {
   await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS cost_credits INTEGER NOT NULL DEFAULT 0;`);
   await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS refunded BOOLEAN NOT NULL DEFAULT false;`);
   await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS invoice_url TEXT;`);
+
   // Blog posts
   await pool.query(`
     CREATE TABLE IF NOT EXISTS blog_posts (
@@ -723,6 +724,7 @@ initDb()
     console.error("❌ DB init failed", e);
     process.exit(1);
   });
+
 // ---- Public blog
 app.get("/api/blog/posts", asyncHandler(async (req, res) => {
   const rows = (await pool.query(
@@ -741,7 +743,7 @@ app.get("/api/blog/posts/:slug", asyncHandler(async (req, res) => {
   res.json({ post: row });
 }));
 
-// ---- Admin blog (requires admin)
+// ---- Admin blog
 app.get("/api/admin/blog/posts", auth, asyncHandler(async (req, res) => {
   if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
   const rows = (await pool.query(
@@ -760,7 +762,6 @@ app.post("/api/admin/blog/posts", auth, asyncHandler(async (req, res) => {
   const content_html = String(req.body?.content_html || "");
   const status = String(req.body?.status || "draft");
   if (!title || !slug) return res.status(400).json({ error: "MISSING_FIELDS" });
-
   const row = (await pool.query(
     "INSERT INTO blog_posts (title, slug, excerpt, cover_url, video_url, content_html, status) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *",
     [title, slug, excerpt, cover_url, video_url, content_html, status]
@@ -772,7 +773,6 @@ app.put("/api/admin/blog/posts/:id", auth, asyncHandler(async (req, res) => {
   if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: "BAD_ID" });
-
   const title = String(req.body?.title || "").trim();
   const slug = String(req.body?.slug || "").trim();
   const excerpt = String(req.body?.excerpt || "");
@@ -781,7 +781,6 @@ app.put("/api/admin/blog/posts/:id", auth, asyncHandler(async (req, res) => {
   const content_html = String(req.body?.content_html || "");
   const status = String(req.body?.status || "draft");
   if (!title || !slug) return res.status(400).json({ error: "MISSING_FIELDS" });
-
   const row = (await pool.query(
     "UPDATE blog_posts SET title=$1, slug=$2, excerpt=$3, cover_url=$4, video_url=$5, content_html=$6, status=$7, updated_at=NOW() WHERE id=$8 RETURNING *",
     [title, slug, excerpt, cover_url, video_url, content_html, status, id]
@@ -798,11 +797,9 @@ app.delete("/api/admin/blog/posts/:id", auth, asyncHandler(async (req, res) => {
   res.json({ ok: true });
 }));
 
-
 // ---- Admin: list users
 app.get("/api/admin/users", auth, asyncHandler(async (req, res) => {
   if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
-
   const limit = Math.min(Math.max(parseInt(req.query?.limit || "50", 10) || 50, 1), 200);
   const offset = Math.max(parseInt(req.query?.offset || "0", 10) || 0, 0);
   const q = String(req.query?.q || "").trim();
@@ -814,10 +811,39 @@ app.get("/api/admin/users", auth, asyncHandler(async (req, res) => {
   const params = q ? [`%${q}%`, limit, offset] : [limit, offset];
 
   const rows = (await pool.query(sqlBase + sqlWhere + sqlOrder + sqlLimit, params)).rows;
+  res.json({ users: rows.map(u => ({ email: u.email, balance: Number(u.balance||0), created_at: u.created_at, is_admin: isAdminEmail(u.email) })), limit, offset, q });
+}));
 
-  res.json({
-    users: rows.map(u => ({ email: u.email, balance: Number(u.balance || 0), created_at: u.created_at, is_admin: isAdminEmail(u.email) })),
-    limit, offset, q
-  });
+app.put("/api/admin/user-update", auth, asyncHandler(async (req, res) => {
+  if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
+  const email = normEmail(String(req.body?.email || ""));
+  const balanceRaw = req.body?.balance;
+  if (!email) return res.status(400).json({ error: "MISSING_EMAIL" });
+  if (balanceRaw === undefined || balanceRaw === null || balanceRaw === "") return res.status(400).json({ error: "MISSING_BALANCE" });
+  const balance = Number(balanceRaw);
+  if (!Number.isFinite(balance) || balance < 0) return res.status(400).json({ error: "INVALID_BALANCE" });
+
+  const u = await getUserByEmail(email);
+  if (!u) return res.status(404).json({ error: "USER_NOT_FOUND" });
+
+  await pool.query("UPDATE users SET balance=$1 WHERE email=$2", [Math.floor(balance), email]);
+  const updated = await getUserByEmail(email);
+  res.json({ ok: true, user: { email: updated.email, balance: Number(updated.balance||0), created_at: updated.created_at, is_admin: isAdminEmail(updated.email) } });
+}));
+
+app.delete("/api/admin/user-delete", auth, asyncHandler(async (req, res) => {
+  if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
+  const email = normEmail(String(req.query?.email || req.body?.email || ""));
+  if (!email) return res.status(400).json({ error: "MISSING_EMAIL" });
+
+  const u = await getUserByEmail(email);
+  if (!u) return res.status(404).json({ error: "USER_NOT_FOUND" });
+
+  try { await pool.query("DELETE FROM videos WHERE email=$1", [email]); } catch {}
+  try { await pool.query("DELETE FROM payments WHERE email=$1", [email]); } catch {}
+  try { await pool.query("DELETE FROM password_resets WHERE email=$1", [email]); } catch {}
+  await pool.query("DELETE FROM users WHERE email=$1", [email]);
+
+  res.json({ ok: true });
 }));
 
