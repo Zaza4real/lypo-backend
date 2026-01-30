@@ -322,7 +322,7 @@ async function initDb() {
     );
 
 CREATE TABLE IF NOT EXISTS password_resets (
-  token_hash TEXT PRIMARY KEY,
+  token TEXT PRIMARY KEY,
   email TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   used_at TIMESTAMPTZ
@@ -373,8 +373,7 @@ CREATE TABLE IF NOT EXISTS payments (
   await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS invoice_url TEXT;`);
   // Migration: older deployments may have password_resets without expected columns
   try {
-    await pool.query('ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS token_hash TEXT;
-    await pool.query('ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS token TEXT;');');
+    await pool.query('ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS token_hash TEXT;');
     await pool.query('ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS email TEXT;');
     await pool.query('ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();');
     await pool.query('ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS used_at TIMESTAMPTZ;');
@@ -701,33 +700,18 @@ app.post("/api/auth/login", async (req, res) => {
 });
 
 
-app.post("/api/auth/forgot-password", asyncHandler(async (req, res) => {
-  const email = normEmail((req.body && req.body.email) || "");
-  if (!email) return res.json({ ok: true });
-
-  // Avoid account enumeration
-  const user = await getUserByEmail(email);
-  if (!user) return res.json({ ok: true });
-
-  const token = crypto.randomBytes(24).toString("hex");
-  const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
-  await pool.query("INSERT INTO password_resets(token_hash, email) VALUES($1,$2)", [tokenHash, email]);
-await sendPasswordResetEmail({ email, token });
-  res.json({ ok: true });
-}));
 
 app.post("/api/auth/reset-password", asyncHandler(async (req, res) => {
   const email = normEmail((req.body && req.body.email) || "");
   const token = String((req.body && req.body.token) || "").trim();
-  const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
   const password = String((req.body && req.body.password) || "");
 
   if (!email || !token || !password) return res.status(400).json({ error: "Missing fields" });
   if (password.length < 6) return res.status(400).json({ error: "Password too short (min 6)" });
 
   const row = (await pool.query(
-    "SELECT token_hash, email, created_at, used_at FROM password_resets WHERE token_hash=$1 AND email=$2",
-    [tokenHash, email]
+    "SELECT token, email, created_at, used_at FROM password_resets WHERE token=$1 AND email=$2",
+    [token, email]
   )).rows[0];
 
   if (!row) return res.status(400).json({ error: "Invalid token" });
@@ -741,10 +725,33 @@ app.post("/api/auth/reset-password", asyncHandler(async (req, res) => {
 
   const passwordHash = await bcrypt.hash(password, 10);
   await pool.query("UPDATE users SET password_hash=$1 WHERE email=$2", [passwordHash, email]);
-  await pool.query("UPDATE password_resets SET used_at=now() WHERE token_hash=$1", [token]);
+  await pool.query("UPDATE password_resets SET used_at=now() WHERE token=$1", [token]);
 
   res.json({ ok: true });
 }));
+
+
+app.post("/api/auth/forgot-password", asyncHandler(async (req, res) => {
+  const email = normEmail((req.body && req.body.email) || "");
+  if (!email) return res.json({ ok: true });
+
+  // Avoid account enumeration
+  const user = await getUserByEmail(email);
+  if (!user) return res.json({ ok: true });
+
+  const token = crypto.randomBytes(24).toString("hex");
+  const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+
+  // Insert using token_hash (your DB enforces NOT NULL on token_hash)
+  await pool.query(
+    "INSERT INTO password_resets(token_hash, email) VALUES($1,$2)",
+    [tokenHash, email]
+  );
+
+  await sendPasswordResetEmail({ email, token });
+  res.json({ ok: true });
+}));
+
 
 
 app.get("/api/auth/me", auth, async (req, res) => {
