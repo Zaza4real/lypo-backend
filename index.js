@@ -770,13 +770,6 @@ function requireEnv(name, value) {
   return value;
 }
 
-/* ---------------------------
-   Replicate client
----------------------------- */
-const replicate = new Replicate({
-  auth: REPLICATE_API_TOKEN
-});
-
 
 /* ---------------------------
    ENV
