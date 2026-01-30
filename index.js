@@ -365,6 +365,17 @@ CREATE TABLE IF NOT EXISTS payments (
   await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS cost_credits INTEGER NOT NULL DEFAULT 0;`);
   await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS refunded BOOLEAN NOT NULL DEFAULT false;`);
   await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS invoice_url TEXT;`);
+  // Migration: older deployments may have password_resets without expected columns
+  try {
+    await pool.query('ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS token TEXT;');
+    await pool.query('ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS email TEXT;');
+    await pool.query('ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();');
+    await pool.query('ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS used_at TIMESTAMPTZ;');
+  } catch (e) {
+    // ignore (table may not exist yet)
+  }
+
+
 }
 
 function normEmail(email) {
