@@ -429,6 +429,53 @@ app.post("/api/auth/login", authRateLimit, asyncHandler(async (req, res) => {
   res.json({ token: signToken(e), user: publicUserRow(u) });
 }));
 
+// Google OAuth Login/Signup (Simple version - works with current database)
+app.post("/api/auth/google", authRateLimit, asyncHandler(async (req, res) => {
+  const { credential } = req.body || {};
+  if (!credential) return res.status(400).json({ error: "Missing Google credential" });
+
+  try {
+    // Verify Google token
+    const response = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${credential}`);
+    if (!response.ok) throw new Error("Invalid Google token");
+    
+    const payload = await response.json();
+    
+    // Extract user info from Google token
+    const googleId = payload.sub;
+    const email = normEmail(payload.email);
+    const name = payload.name || "";
+    
+    if (!googleId || !email) {
+      return res.status(400).json({ error: "Invalid Google account data" });
+    }
+
+    // Check if user exists by email
+    let user = await getUserByEmail(email);
+    
+    // If no user exists, create new one (using current database schema)
+    if (!user) {
+      // For Google users, create with a random password (they'll use Google to login)
+      const randomPassword = crypto.randomBytes(32).toString('hex');
+      const passwordHash = await bcrypt.hash(randomPassword, 10);
+      
+      user = await createUser(email, passwordHash);
+      
+      // Notify support (non-blocking)
+      Promise.resolve(sendSupportNewUserEmail({ 
+        email, 
+        ip: (req.headers["x-forwarded-for"]||req.ip||"").toString().split(",")[0].trim(), 
+        ua: req.headers["user-agent"]||"" 
+      })).catch((err) => console.error("Support email failed:", err));
+    }
+
+    res.json({ token: signToken(email), user: publicUserRow(user) });
+  } catch (error) {
+    console.error("Google auth error:", error);
+    res.status(401).json({ error: "Google authentication failed" });
+  }
+}));
+
 app.get("/api/auth/me", auth, asyncHandler(async (req, res) => {
   const email = req.user?.email;
   const u = await getUserByEmail(email);
