@@ -876,6 +876,18 @@ app.get("/api/admin/blog/posts", auth, asyncHandler(async (req, res) => {
   res.json({ posts: rows });
 }));
 
+app.get("/api/admin/blog/posts/:id", auth, asyncHandler(async (req, res) => {
+  if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "BAD_ID" });
+  const row = (await pool.query(
+    "SELECT id, title, slug, excerpt, cover_url, video_url, content_html, status, created_at, updated_at FROM blog_posts WHERE id=$1 LIMIT 1",
+    [id]
+  )).rows[0];
+  if (!row) return res.status(404).json({ error: "NOT_FOUND" });
+  res.json({ post: row });
+}));
+
 app.post("/api/admin/blog/posts", auth, asyncHandler(async (req, res) => {
   if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
   const title = String(req.body?.title || "").trim();
