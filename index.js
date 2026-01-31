@@ -125,8 +125,12 @@ async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       email TEXT PRIMARY KEY,
-      password_hash TEXT NOT NULL,
+      password_hash TEXT,
       balance INTEGER NOT NULL DEFAULT 0,
+      google_id TEXT UNIQUE,
+      name TEXT,
+      picture TEXT,
+      auth_provider TEXT DEFAULT 'email',
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
@@ -193,16 +197,26 @@ function signToken(email) {
 async function getUserByEmail(email) {
   const e = normEmail(email);
   const { rows } = await pool.query(
-    "SELECT email, password_hash, balance, created_at FROM users WHERE email=$1",
+    "SELECT email, password_hash, balance, google_id, name, picture, auth_provider, created_at FROM users WHERE email=$1",
     [e]
   );
   return rows[0] || null;
 }
-async function createUser(email, passwordHash) {
-  const e = normEmail(email);
+
+async function getUserByGoogleId(googleId) {
   const { rows } = await pool.query(
-    "INSERT INTO users (email, password_hash, balance) VALUES ($1,$2,0) RETURNING email, password_hash, balance, created_at",
-    [e, passwordHash]
+    "SELECT email, password_hash, balance, google_id, name, picture, auth_provider, created_at FROM users WHERE google_id=$1",
+    [googleId]
+  );
+  return rows[0] || null;
+}
+async function createUser(email, passwordHash, options = {}) {
+  const e = normEmail(email);
+  const { googleId, name, picture, authProvider = 'email' } = options;
+  
+  const { rows } = await pool.query(
+    "INSERT INTO users (email, password_hash, balance, google_id, name, picture, auth_provider) VALUES ($1,$2,0,$3,$4,$5,$6) RETURNING email, password_hash, balance, google_id, name, picture, auth_provider, created_at",
+    [e, passwordHash, googleId, name, picture, authProvider]
   );
   return rows[0];
 }
@@ -435,6 +449,69 @@ app.post("/api/auth/login", authRateLimit, asyncHandler(async (req, res) => {
   if (!ok) return res.status(401).json({ error: "Invalid credentials" });
 
   res.json({ token: signToken(e), user: publicUserRow(u) });
+}));
+
+// Google OAuth Login/Signup
+app.post("/api/auth/google", authRateLimit, asyncHandler(async (req, res) => {
+  const { credential } = req.body || {};
+  if (!credential) return res.status(400).json({ error: "Missing Google credential" });
+
+  try {
+    // Verify Google token
+    const response = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${credential}`);
+    if (!response.ok) throw new Error("Invalid Google token");
+    
+    const payload = await response.json();
+    
+    // Extract user info from Google token
+    const googleId = payload.sub;
+    const email = normEmail(payload.email);
+    const name = payload.name || "";
+    const picture = payload.picture || "";
+    
+    if (!googleId || !email) {
+      return res.status(400).json({ error: "Invalid Google account data" });
+    }
+
+    // Check if user exists by Google ID
+    let user = await getUserByGoogleId(googleId);
+    
+    // If not found by Google ID, check by email
+    if (!user) {
+      user = await getUserByEmail(email);
+      
+      // If user exists with email but no Google ID, update to link Google account
+      if (user && !user.google_id) {
+        await pool.query(
+          "UPDATE users SET google_id=$1, name=$2, picture=$3, auth_provider='google' WHERE email=$4",
+          [googleId, name, picture, email]
+        );
+        user = await getUserByEmail(email);
+      }
+    }
+    
+    // If no user exists, create new one
+    if (!user) {
+      user = await createUser(email, null, {
+        googleId,
+        name,
+        picture,
+        authProvider: 'google'
+      });
+      
+      // Notify support (non-blocking)
+      Promise.resolve(sendSupportNewUserEmail({ 
+        email, 
+        ip: (req.headers["x-forwarded-for"]||req.ip||"").toString().split(",")[0].trim(), 
+        ua: req.headers["user-agent"]||"" 
+      })).catch((err) => console.error("Support email failed:", err));
+    }
+
+    res.json({ token: signToken(email), user: publicUserRow(user) });
+  } catch (error) {
+    console.error("Google auth error:", error);
+    res.status(401).json({ error: "Google authentication failed" });
+  }
 }));
 
 app.get("/api/auth/me", auth, asyncHandler(async (req, res) => {
