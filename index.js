@@ -199,6 +199,15 @@ async function getUserByEmail(email) {
   return rows[0] || null;
 }
 
+async function createUser(email, passwordHash) {
+  const e = normEmail(email);
+  const { rows } = await pool.query(
+    "INSERT INTO users (email, password_hash, balance) VALUES ($1,$2,0) RETURNING email, password_hash, balance, created_at",
+    [e, passwordHash]
+  );
+  return rows[0];
+}
+
 async function recordPayment({ email, stripeSessionId, amountUsd, lypos, status, invoiceUrl }) {
   const e = normEmail(email);
   await pool.query(
@@ -481,6 +490,76 @@ app.get("/api/auth/me", auth, asyncHandler(async (req, res) => {
   const u = await getUserByEmail(email);
   if (!u) return res.status(401).json({ error: "Invalid user" });
   res.json({ user: publicUserRow(u) });
+}));
+
+// ---- Support Contact Form
+app.post("/api/support", asyncHandler(async (req, res) => {
+  const { email, subject, message } = req.body || {};
+  
+  // Validate inputs
+  if (!message || String(message).trim().length === 0) {
+    return res.status(400).json({ error: "Message is required" });
+  }
+  
+  // Get user email if authenticated
+  let fromEmail = String(email || "").trim();
+  if (req.headers.authorization) {
+    try {
+      const token = req.headers.authorization.replace(/^Bearer\s+/i, "");
+      const decoded = jwt.verify(token, JWT_SECRET);
+      if (decoded.email) fromEmail = decoded.email;
+    } catch (e) {
+      // Not authenticated, use provided email
+    }
+  }
+  
+  if (!fromEmail) {
+    return res.status(400).json({ error: "Email is required" });
+  }
+  
+  // Send email to support using Resend
+  const apiKey = process.env.RESEND_API_KEY || "";
+  const to = process.env.SUPPORT_EMAIL || "";
+  const from = process.env.EMAIL_FROM || "Lypo <no-reply@lypo.org>";
+  
+  if (!apiKey || !to) {
+    console.warn("⚠️ Support email not configured (missing RESEND_API_KEY or SUPPORT_EMAIL)");
+    return res.status(500).json({ error: "Support email not configured" });
+  }
+  
+  const resend = new Resend(apiKey);
+  const emailSubject = subject ? `Support: ${subject}` : "Support Message";
+  const html = `
+    <div style="font-family:Arial,sans-serif;line-height:1.6">
+      <h2 style="margin:0 0 12px 0;">Support Message</h2>
+      <p style="margin:0 0 8px 0;"><strong>From:</strong> ${fromEmail}</p>
+      ${subject ? `<p style="margin:0 0 8px 0;"><strong>Subject:</strong> ${subject}</p>` : ''}
+      <p style="margin:0 0 8px 0;"><strong>Message:</strong></p>
+      <div style="padding:12px; background:#f5f5f5; border-left:3px solid #0066cc;">
+        ${String(message).replace(/\n/g, '<br>')}
+      </div>
+      <p style="margin:12px 0 0 0;color:#666;">
+        Sent from: ${req.headers['user-agent'] || 'Unknown browser'}<br>
+        IP: ${(req.headers["x-forwarded-for"]||req.ip||"").toString().split(",")[0].trim() || 'Unknown'}<br>
+        Time: ${new Date().toISOString()}
+      </p>
+    </div>
+  `;
+  
+  try {
+    await resend.emails.send({ 
+      from, 
+      to, 
+      subject: emailSubject, 
+      html,
+      replyTo: fromEmail // Allow direct reply
+    });
+    
+    res.json({ ok: true, message: "Message sent successfully" });
+  } catch (err) {
+    console.error("❌ Resend error:", err);
+    res.status(500).json({ error: "Failed to send email" });
+  }
 }));
 
 // ---- Credits
