@@ -66,6 +66,10 @@ const allowedOrigins = new Set([
   "https://digitalgeekworld.com",
   "https://www.digitalgeekworld.com",
   "https://homepage-3d78.onrender.com",
+  "http://localhost:3000",
+  "http://localhost:5173",
+  "http://127.0.0.1:3000",
+  "http://127.0.0.1:5173",
   process.env.FRONTEND_URL || ""
 ].filter(Boolean));
 
@@ -73,14 +77,26 @@ const CORS_ALLOW_ALL = process.env.CORS_ALLOW_ALL === "1";
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
+  
+  // Set CORS headers for allowed origins
   if (origin && (CORS_ALLOW_ALL || allowedOrigins.has(origin))) {
     res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+  } else if (!origin) {
+    // If no origin header (same-origin request), allow it
+    res.setHeader("Access-Control-Allow-Origin", "*");
   }
+  
   res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Credentials", "true");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH");
+  res.setHeader("Access-Control-Max-Age", "86400"); // 24 hours
+  
+  // Handle preflight
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+  
   next();
 });
 
@@ -989,13 +1005,19 @@ app.delete("/api/admin/user-delete", auth, asyncHandler(async (req, res) => {
 ---------------------------- */
 app.use((err, req, res, next) => {
   console.error("🔥 Unhandled error:", err);
-  // If CORS middleware did not run (rare), try to set origin header anyway
+  
+  // Ensure CORS headers are set even on errors
   const origin = req.headers.origin;
   if (origin && (CORS_ALLOW_ALL || allowedOrigins.has(origin))) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Access-Control-Allow-Credentials", "true");
     res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH");
+  } else if (!origin) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
   }
+  
   res.status(err.statusCode || 500).json({
     error: "SERVER_ERROR",
     message: err.message || "Unknown error"
