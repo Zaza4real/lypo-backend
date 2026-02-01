@@ -1232,9 +1232,9 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
 
         // Create Replicate prediction for captions
         // Using a caption/subtitle model from Replicate
-        const replicate = new Replicate({ auth: TIKTOK_API_TOKEN });
+        const tiktokReplicate = new Replicate({ auth: REPLICATE_API_TOKEN });
         
-        const prediction = await replicate.predictions.create({
+        const prediction = await tiktokReplicate.predictions.create({
           version: "fda9941afbe75fb34b1852ed8c42ee2e45b6f29583f990e1c0a1f6bbca3a5d6e", // whisper model for transcription
           input: {
             audio: videoUrl,
@@ -1268,6 +1268,18 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
 
       } catch (e) {
         console.error("TikTok captions error:", e);
+        
+        // Refund credits if generation failed after charging
+        try {
+          await pool.query(
+            "UPDATE users SET balance = balance + $1 WHERE email = $2",
+            [TIKTOK_COST, email]
+          );
+          console.log(`Refunded ${TIKTOK_COST} credits to ${email} due to error`);
+        } catch (refundErr) {
+          console.error("Failed to refund credits:", refundErr);
+        }
+        
         res.status(e.statusCode || 500).json({ 
           error: e?.message || "Failed to generate captions" 
         });
