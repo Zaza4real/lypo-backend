@@ -1241,14 +1241,7 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
           }
         });
 
-        // Store job in database
-        await pool.query(
-          `INSERT INTO tiktok_jobs (job_id, email, status, input_url, created_at)
-           VALUES ($1, $2, $3, $4, NOW())
-           ON CONFLICT (job_id) DO UPDATE SET status = $3`,
-          [prediction.id, email, prediction.status, videoUrl]
-        );
-
+        // Return prediction ID directly (no database needed!)
         res.json({
           jobId: prediction.id,
           status: prediction.status
@@ -1287,41 +1280,12 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
  */
 app.get("/api/tiktok-captions/:jobId", auth, asyncHandler(async (req, res) => {
   const { jobId } = req.params;
-  const email = req.user.email;
 
-  // Check job exists and belongs to user
-  const result = await pool.query(
-    `SELECT * FROM tiktok_jobs WHERE job_id = $1 AND email = $2`,
-    [jobId, email]
-  );
-
-  if (result.rows.length === 0) {
-    return res.status(404).json({ error: "Job not found" });
-  }
-
-  const job = result.rows[0];
-
-  // If already completed, return cached result
-  if (job.status === "succeeded" && job.output_url) {
-    return res.json({
-      status: "succeeded",
-      output: job.output_url
-    });
-  }
-
-  // Otherwise check Replicate
+  // Query Replicate directly (no database needed!)
   requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
   const replicate = new Replicate({ auth: REPLICATE_API_TOKEN });
   
   const prediction = await replicate.predictions.get(jobId);
-
-  // Update database
-  await pool.query(
-    `UPDATE tiktok_jobs 
-     SET status = $1, output_url = $2, updated_at = NOW()
-     WHERE job_id = $3`,
-    [prediction.status, prediction.output || null, jobId]
-  );
 
   res.json({
     status: prediction.status,
