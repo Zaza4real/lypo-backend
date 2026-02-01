@@ -1237,7 +1237,10 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
         const prediction = await tiktokReplicate.predictions.create({
           version: "18a45ff0d95feb4449d192bbdc06b4a6df168fa33def76dfc51b78ae224b599b", // fictions-ai/autocaption
           input: {
-            video_file_input: videoUrl  // Correct parameter name!
+            video_file_input: videoUrl,
+            font_size: 6,              // Custom font size
+            subs_position: "bottom",    // Position at bottom
+            max_chars: 16              // Max 16 characters per line
           }
         });
 
