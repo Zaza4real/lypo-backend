@@ -1231,26 +1231,24 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
         const videoUrl = `${base}/${key}`;
 
         // Create Replicate prediction for captions
-        // Using a caption/subtitle model from Replicate
+        // Using Whisper for transcription (publicly available)
         const tiktokReplicate = new Replicate({ auth: REPLICATE_API_TOKEN });
         
         const prediction = await tiktokReplicate.predictions.create({
-          version: "fda9941afbe75fb34b1852ed8c42ee2e45b6f29583f990e1c0a1f6bbca3a5d6e", // whisper model for transcription
+          version: "3ab86df6c8f54c11309d4d1f930ac292bad43fbe626244e44f9d47be5a83e126", // openai/whisper - publicly available
           input: {
             audio: videoUrl,
             model: "large-v3",
+            transcription: "srt",
             translate: false,
             temperature: 0,
-            transcription: "srt",
             suppress_tokens: "-1",
-            logprob_threshold: -1,
+            logprob_threshold: -1.0,
             no_speech_threshold: 0.6,
             condition_on_previous_text: true,
             compression_ratio_threshold: 2.4,
             temperature_increment_on_fallback: 0.2
-          },
-          webhook: `${process.env.BACKEND_URL || "https://lypo-backend.onrender.com"}/api/tiktok-captions/webhook`,
-          webhook_events_filter: ["completed"]
+          }
         });
 
         // Store job in database
