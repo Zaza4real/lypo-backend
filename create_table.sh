@@ -1,0 +1,43 @@
+#!/bin/bash
+# CREATE TIKTOK_JOBS TABLE IN DATABASE
+
+echo "🗄️  CREATING TIKTOK_JOBS TABLE"
+echo ""
+echo "You need to run the SQL migration in your PostgreSQL database."
+echo ""
+echo "======================================"
+echo "OPTION 1: Use Render Web Shell"
+echo "======================================"
+echo ""
+echo "1. Go to: https://dashboard.render.com"
+echo "2. Click your PostgreSQL database"
+echo "3. Click 'Connect' (top right)"
+echo "4. Click 'External Connection' tab"
+echo "5. Copy the 'PSQL Command'"
+echo "6. Open terminal and paste the command"
+echo "7. When connected, copy-paste this SQL:"
+echo ""
+cat migrations/create_tiktok_jobs_table.sql
+echo ""
+echo ""
+echo "======================================"
+echo "OPTION 2: Use DATABASE_URL"
+echo "======================================"
+echo ""
+echo "If you have DATABASE_URL, run:"
+echo ""
+echo 'psql "$DATABASE_URL" < migrations/create_tiktok_jobs_table.sql'
+echo ""
+echo ""
+echo "======================================"
+echo "OPTION 3: Let me do it for you"
+echo "======================================"
+echo ""
+echo "Paste your DATABASE_URL here and run:"
+echo ""
+echo 'export DATABASE_URL="your-url-here"'
+echo 'psql "$DATABASE_URL" < migrations/create_tiktok_jobs_table.sql'
+echo ""
+echo ""
+echo "✅ After creating table, test TikTok tool again!"
+echo ""

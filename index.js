@@ -152,6 +152,7 @@ async function initDb() {
       output_url TEXT,
       cost_credits INTEGER NOT NULL DEFAULT 0,
       refunded BOOLEAN NOT NULL DEFAULT false,
+      type TEXT NOT NULL DEFAULT 'video_translation',
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
@@ -160,6 +161,7 @@ async function initDb() {
   // Migrations for existing databases
   await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS cost_credits INTEGER NOT NULL DEFAULT 0;`);
   await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS refunded BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'video_translation';`);
   await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS invoice_url TEXT;`);
 
   // Blog posts
@@ -633,7 +635,7 @@ app.get("/api/account/payments", auth, asyncHandler(async (req, res) => {
 app.get("/api/account/videos", auth, asyncHandler(async (req, res) => {
   const email = normEmail(req.user.email);
   const { rows } = await pool.query(
-    "SELECT prediction_id, status, input_url, output_url, created_at FROM videos WHERE email=$1 ORDER BY created_at DESC LIMIT 100",
+    "SELECT prediction_id, status, input_url, output_url, type, cost_credits, created_at FROM videos WHERE email=$1 ORDER BY created_at DESC LIMIT 100",
     [email]
   );
   res.json({ videos: rows });
@@ -1244,7 +1246,16 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
           }
         });
 
-        // Return prediction ID directly (no database needed!)
+        // Save to videos table for dashboard history
+        await pool.query(
+          `INSERT INTO videos (email, prediction_id, status, input_url, cost_credits, type)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           ON CONFLICT (prediction_id) DO UPDATE SET
+             status = EXCLUDED.status,
+             updated_at = now()`,
+          [email, prediction.id, prediction.status, videoUrl, TIKTOK_COST, 'tiktok_captions']
+        );
+
         res.json({
           jobId: prediction.id,
           status: prediction.status
@@ -1284,11 +1295,30 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
 app.get("/api/tiktok-captions/:jobId", auth, asyncHandler(async (req, res) => {
   const { jobId } = req.params;
 
-  // Query Replicate directly (no database needed!)
+  // Query Replicate directly
   requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
   const replicate = new Replicate({ auth: REPLICATE_API_TOKEN });
   
   const prediction = await replicate.predictions.get(jobId);
+
+  // Update database with latest status and output
+  if (prediction.status === 'succeeded' && prediction.output) {
+    const outputUrl = Array.isArray(prediction.output) ? prediction.output[0] : prediction.output;
+    
+    await pool.query(
+      `UPDATE videos 
+       SET status = $1, output_url = $2, updated_at = now() 
+       WHERE prediction_id = $3`,
+      [prediction.status, outputUrl, jobId]
+    );
+  } else if (prediction.status === 'failed' || prediction.status === 'canceled') {
+    await pool.query(
+      `UPDATE videos 
+       SET status = $1, updated_at = now() 
+       WHERE prediction_id = $2`,
+      [prediction.status, jobId]
+    );
+  }
 
   res.json({
     status: prediction.status,
