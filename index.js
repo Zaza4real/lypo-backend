@@ -53,6 +53,48 @@ async function sendSupportNewUserEmail({ email, ip, ua }) {
   }
 }
 
+/* ---------------------------
+   Helper: Send credit purchase notification
+---------------------------- */
+async function sendCreditPurchaseEmail(email, credits, amountUsd, invoiceUrl) {
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) {
+    console.warn("⚠️ RESEND_API_KEY not set, skipping email");
+    return;
+  }
+
+  const from = process.env.RESEND_FROM_EMAIL || "onboarding@resend.dev";
+  const to = process.env.RESEND_TO_EMAIL || "support@lypo.org";
+
+  if (!to) {
+    console.warn("⚠️ RESEND_TO_EMAIL not set, skipping");
+    return;
+  }
+
+  const resend = new Resend(apiKey);
+  const subject = `💰 Credit Purchase: ${email} bought ${credits} credits`;
+  const html = `
+    <div style="font-family:Arial,sans-serif;line-height:1.5">
+      <h2 style="margin:0 0 12px 0;color:#10b981;">💰 New Credit Purchase</h2>
+      <div style="background:#f0fdf4;border-left:4px solid #10b981;padding:16px;margin:16px 0;">
+        <p style="margin:0 0 8px 0;font-size:24px;font-weight:bold;color:#10b981;">${credits} Credits</p>
+        <p style="margin:0 0 8px 0;"><strong>Customer:</strong> ${email}</p>
+        <p style="margin:0 0 8px 0;"><strong>Amount Paid:</strong> $${amountUsd.toFixed(2)} USD</p>
+        <p style="margin:0 0 8px 0;"><strong>Rate:</strong> ${(credits / amountUsd).toFixed(0)} credits per $1</p>
+        ${invoiceUrl ? `<p style="margin:0 0 8px 0;"><strong>Receipt:</strong> <a href="${invoiceUrl}" style="color:#0066cc;">View Receipt</a></p>` : ''}
+      </div>
+      <p style="margin:0;color:#666;font-size:13px;">Timestamp (UTC): ${new Date().toISOString()}</p>
+    </div>
+  `;
+
+  try {
+    await resend.emails.send({ from, to, subject, html });
+    console.log("✅ Credit purchase email sent to:", to);
+  } catch (err) {
+    console.error("❌ Resend credit purchase email error:", err);
+  }
+}
+
 const app = express();
 app.set("trust proxy", 1);
 
@@ -337,6 +379,9 @@ try {
         await recordPayment({ email, stripeSessionId: sessionId, amountUsd: amountTotal, lypos, status: "completed", invoiceUrl });
         await addBalance(email, lypos);
         console.log("✅ Payment stored + credited LYPOS:", { email, lypos, amountTotal });
+        
+        // Send email notification to admin
+        await sendCreditPurchaseEmail(email, lypos, amountTotal, invoiceUrl);
       } catch (e) {
         console.log("⚠️ Webhook credit failed:", e?.message || e);
       }
@@ -736,6 +781,9 @@ if (!invoiceUrl && pi?.latest_charge) {
       invoiceUrl
     });
     balRes = await addBalance(email, credits);
+    
+    // Send email notification to admin
+    await sendCreditPurchaseEmail(email, credits, amountTotal, invoiceUrl);
 } catch (e) {
   // If already recorded, ignore; still return current balance
   const msg = String(e?.message || "");
