@@ -1162,7 +1162,7 @@ process.on("uncaughtException", (err) => {
  */
 app.post("/api/tiktok-captions", auth, (req, res) => {
   try {
-    const TIKTOK_API_TOKEN = process.env.REPLICATE_API_TOKEN || "r8_2i75FyYBy7HYZML9g2MqymCgRZOlTXf45xZ4n";
+    requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
     
     requireEnv("S3_ENDPOINT", S3_ENDPOINT);
     requireEnv("S3_ACCESS_KEY_ID", S3_ACCESS_KEY_ID);
@@ -1310,8 +1310,8 @@ app.get("/api/tiktok-captions/:jobId", auth, asyncHandler(async (req, res) => {
   }
 
   // Otherwise check Replicate
-  const TIKTOK_API_TOKEN = process.env.REPLICATE_API_TOKEN || "r8_2i75FyYBy7HYZML9g2MqymCgRZOlTXf45xZ4n";
-  const replicate = new Replicate({ auth: TIKTOK_API_TOKEN });
+  requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
+  const replicate = new Replicate({ auth: REPLICATE_API_TOKEN });
   
   const prediction = await replicate.predictions.get(jobId);
 
