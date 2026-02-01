@@ -1150,3 +1150,182 @@ process.on("unhandledRejection", (reason) => {
 process.on("uncaughtException", (err) => {
   console.error("🔥 UncaughtException:", err);
 });
+
+// ========================================
+// TIKTOK CAPTIONS API
+// ========================================
+
+/**
+ * POST /api/tiktok-captions
+ * Upload video and generate captions/subtitles
+ * Cost: 50 credits per video
+ */
+app.post("/api/tiktok-captions", auth, (req, res) => {
+  try {
+    const TIKTOK_API_TOKEN = process.env.REPLICATE_API_TOKEN || "r8_2i75FyYBy7HYZML9g2MqymCgRZOlTXf45xZ4n";
+    
+    requireEnv("S3_ENDPOINT", S3_ENDPOINT);
+    requireEnv("S3_ACCESS_KEY_ID", S3_ACCESS_KEY_ID);
+    requireEnv("S3_SECRET_ACCESS_KEY", S3_SECRET_ACCESS_KEY);
+    requireEnv("S3_BUCKET", S3_BUCKET);
+    requireEnv("PUBLIC_BASE_URL", PUBLIC_BASE_URL);
+
+    const bb = Busboy({
+      headers: req.headers,
+      limits: { fileSize: 200 * 1024 * 1024 } // 200MB
+    });
+
+    let fileInfo = null;
+    let chunks = [];
+
+    bb.on("file", (name, file, info) => {
+      if (name !== "video") {
+        file.resume();
+        return;
+      }
+      fileInfo = info;
+      chunks = [];
+      file.on("data", (d) => chunks.push(d));
+      file.on("limit", () => { chunks = []; });
+      file.on("error", (e) => { console.error("Upload stream error:", e); });
+    });
+
+    bb.on("finish", async () => {
+      try {
+        if (!fileInfo) return res.status(400).json({ error: "Missing video file (field name: video)" });
+
+        // Charge 50 credits (fixed cost)
+        const TIKTOK_COST = 50;
+        const email = req.user.email;
+        const charge = await chargeBalance(email, TIKTOK_COST);
+        
+        if (!charge.ok && charge.code === "NO_USER") {
+          return res.status(401).json({ error: "Invalid user" });
+        }
+        if (!charge.ok && charge.code === "INSUFFICIENT") {
+          return res.status(402).json({ 
+            error: "INSUFFICIENT_CREDITS", 
+            required: TIKTOK_COST, 
+            balance: charge.balance 
+          });
+        }
+
+        const body = Buffer.concat(chunks);
+        if (!body.length) {
+          return res.status(400).json({ error: "Empty upload or file too large" });
+        }
+
+        // Upload to S3
+        const original = fileInfo.filename || "video.mp4";
+        const ext = (original.split(".").pop() || "mp4").toLowerCase();
+        const key = `tiktok-uploads/${crypto.randomUUID()}.${ext}`;
+
+        await s3.send(new PutObjectCommand({
+          Bucket: S3_BUCKET,
+          Key: key,
+          Body: body,
+          ContentType: fileInfo.mimeType || "video/mp4"
+        }));
+
+        const base = PUBLIC_BASE_URL.replace(/\/$/, "");
+        const videoUrl = `${base}/${key}`;
+
+        // Create Replicate prediction for captions
+        // Using a caption/subtitle model from Replicate
+        const replicate = new Replicate({ auth: TIKTOK_API_TOKEN });
+        
+        const prediction = await replicate.predictions.create({
+          version: "fda9941afbe75fb34b1852ed8c42ee2e45b6f29583f990e1c0a1f6bbca3a5d6e", // whisper model for transcription
+          input: {
+            audio: videoUrl,
+            model: "large-v3",
+            translate: false,
+            temperature: 0,
+            transcription: "srt",
+            suppress_tokens: "-1",
+            logprob_threshold: -1,
+            no_speech_threshold: 0.6,
+            condition_on_previous_text: true,
+            compression_ratio_threshold: 2.4,
+            temperature_increment_on_fallback: 0.2
+          },
+          webhook: `${process.env.BACKEND_URL || "https://lypo-backend.onrender.com"}/api/tiktok-captions/webhook`,
+          webhook_events_filter: ["completed"]
+        });
+
+        // Store job in database
+        await pool.query(
+          `INSERT INTO tiktok_jobs (job_id, email, status, input_url, created_at)
+           VALUES ($1, $2, $3, $4, NOW())
+           ON CONFLICT (job_id) DO UPDATE SET status = $3`,
+          [prediction.id, email, prediction.status, videoUrl]
+        );
+
+        res.json({
+          jobId: prediction.id,
+          status: prediction.status
+        });
+
+      } catch (e) {
+        console.error("TikTok captions error:", e);
+        res.status(e.statusCode || 500).json({ 
+          error: e?.message || "Failed to generate captions" 
+        });
+      }
+    });
+
+    req.pipe(bb);
+  } catch (e) {
+    console.error("TikTok captions error:", e);
+    res.status(e.statusCode || 500).json({ error: e?.message || "Internal error" });
+  }
+});
+
+/**
+ * GET /api/tiktok-captions/:jobId
+ * Check status of caption generation
+ */
+app.get("/api/tiktok-captions/:jobId", auth, asyncHandler(async (req, res) => {
+  const { jobId } = req.params;
+  const email = req.user.email;
+
+  // Check job exists and belongs to user
+  const result = await pool.query(
+    `SELECT * FROM tiktok_jobs WHERE job_id = $1 AND email = $2`,
+    [jobId, email]
+  );
+
+  if (result.rows.length === 0) {
+    return res.status(404).json({ error: "Job not found" });
+  }
+
+  const job = result.rows[0];
+
+  // If already completed, return cached result
+  if (job.status === "succeeded" && job.output_url) {
+    return res.json({
+      status: "succeeded",
+      output: job.output_url
+    });
+  }
+
+  // Otherwise check Replicate
+  const TIKTOK_API_TOKEN = process.env.REPLICATE_API_TOKEN || "r8_2i75FyYBy7HYZML9g2MqymCgRZOlTXf45xZ4n";
+  const replicate = new Replicate({ auth: TIKTOK_API_TOKEN });
+  
+  const prediction = await replicate.predictions.get(jobId);
+
+  // Update database
+  await pool.query(
+    `UPDATE tiktok_jobs 
+     SET status = $1, output_url = $2, updated_at = NOW()
+     WHERE job_id = $3`,
+    [prediction.status, prediction.output || null, jobId]
+  );
+
+  res.json({
+    status: prediction.status,
+    output: prediction.output
+  });
+}));
+
