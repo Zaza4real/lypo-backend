@@ -1231,23 +1231,14 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
         const videoUrl = `${base}/${key}`;
 
         // Create Replicate prediction for captions
-        // Using Whisper for transcription (publicly available)
+        // Using autocaption - adds karaoke-style captions to video (perfect for TikTok!)
         const tiktokReplicate = new Replicate({ auth: REPLICATE_API_TOKEN });
         
         const prediction = await tiktokReplicate.predictions.create({
-          version: "3ab86df6c8f54c11309d4d1f930ac292bad43fbe626244e44f9d47be5a83e126", // openai/whisper - publicly available
+          version: "18a45ff0d95feb4449d192bbdc06b4a6df168fa33def76dfc51b78ae224b599b", // fictions-ai/autocaption
           input: {
-            audio: videoUrl,
-            model: "large-v3",
-            transcription: "srt",
-            translate: false,
-            temperature: 0,
-            suppress_tokens: "-1",
-            logprob_threshold: -1.0,
-            no_speech_threshold: 0.6,
-            condition_on_previous_text: true,
-            compression_ratio_threshold: 2.4,
-            temperature_increment_on_fallback: 0.2
+            video: videoUrl
+            // Model automatically adds karaoke-style captions - no other params needed!
           }
         });
 
