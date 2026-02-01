@@ -1242,7 +1242,10 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
             video_file_input: videoUrl,
             font_size: 6,              // Custom font size
             subs_position: "bottom",    // Position at bottom
-            max_chars: 16              // Max 16 characters per line
+            max_chars: 16,             // Max 16 characters per line
+            output_video_format: "mp4", // Ensure mp4 output
+            video_width: null,          // Preserve original width (auto)
+            video_height: null          // Preserve original height (auto)
           }
         });
 
