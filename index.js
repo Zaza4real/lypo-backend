@@ -1237,8 +1237,7 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
         const prediction = await tiktokReplicate.predictions.create({
           version: "18a45ff0d95feb4449d192bbdc06b4a6df168fa33def76dfc51b78ae224b599b", // fictions-ai/autocaption
           input: {
-            video: videoUrl
-            // Model automatically adds karaoke-style captions - no other params needed!
+            video_file_input: videoUrl  // Correct parameter name!
           }
         });
 
