@@ -246,7 +246,7 @@ async function getUserByEmail(email) {
 async function createUser(email, passwordHash) {
   const e = normEmail(email);
   const { rows } = await pool.query(
-    "INSERT INTO users (email, password_hash, balance) VALUES ($1,$2,0) RETURNING email, password_hash, balance, created_at",
+    "INSERT INTO users (email, password_hash, balance) VALUES ($1,$2,50) RETURNING email, password_hash, balance, created_at",
     [e, passwordHash]
   );
   return rows[0];
