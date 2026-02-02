@@ -1528,9 +1528,9 @@ app.post("/api/kling-video", auth, (req, res) => {
 
         // Store in database
         await pool.query(
-          `INSERT INTO videos (email, prediction_id, status, source_url, credits_used, tool) 
+          `INSERT INTO videos (email, prediction_id, status, input_url, cost_credits, type) 
            VALUES ($1, $2, $3, $4, $5, $6)`,
-          [email, prediction.id, prediction.status, imageUrl, KLING_COST, 'kling_video']
+          [email, prediction.id, prediction.status, imageUrl || null, KLING_COST, 'kling_video']
         );
 
         res.json({
@@ -1543,13 +1543,14 @@ app.post("/api/kling-video", auth, (req, res) => {
         
         // Refund credits if generation failed after charging
         try {
+          const { email: userEmail } = req.user;
           const videoDuration = parseInt(fields.duration) || 10;
           const refundAmount = videoDuration * KLING_COST_PER_SECOND;
           await pool.query(
             "UPDATE users SET balance = balance + $1 WHERE email = $2",
-            [refundAmount, email]
+            [refundAmount, userEmail]
           );
-          console.log(`Refunded ${refundAmount} credits to ${email} due to error`);
+          console.log(`Refunded ${refundAmount} credits to ${userEmail} due to error`);
         } catch (refundErr) {
           console.error("Failed to refund credits:", refundErr);
         }
