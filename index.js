@@ -264,17 +264,19 @@ async function recordPayment({ email, stripeSessionId, amountUsd, lypos, status,
   );
 }
 
-async function upsertVideo({ email, predictionId, status, inputUrl, outputUrl }) {
+async function upsertVideo({ email, predictionId, status, inputUrl, outputUrl, costCredits, type }) {
   const e = normEmail(email);
   await pool.query(
-    `INSERT INTO videos (email, prediction_id, status, input_url, output_url)
-     VALUES ($1,$2,$3,$4,$5)
+    `INSERT INTO videos (email, prediction_id, status, input_url, output_url, cost_credits, type)
+     VALUES ($1,$2,$3,$4,$5,$6,$7)
      ON CONFLICT (prediction_id) DO UPDATE SET
        status=EXCLUDED.status,
        input_url=COALESCE(EXCLUDED.input_url, videos.input_url),
        output_url=COALESCE(EXCLUDED.output_url, videos.output_url),
+       cost_credits=COALESCE(EXCLUDED.cost_credits, videos.cost_credits),
+       type=COALESCE(EXCLUDED.type, videos.type),
        updated_at=now()`,
-    [e, predictionId || null, status || "starting", inputUrl || null, outputUrl || null]
+    [e, predictionId || null, status || "starting", inputUrl || null, outputUrl || null, costCredits || 0, type || 'video_translation']
   );
 }
 
@@ -327,6 +329,67 @@ async function chargeBalance(email, cost) {
     throw err;
   } finally {
     client.release();
+  }
+}
+
+/**
+ * Refund credits for a failed prediction
+ * @param {string} predictionId - The prediction ID
+ * @param {number} refundAmount - Amount of credits to refund (optional, will use cost_credits from DB if not provided)
+ * @returns {Promise<{ok: boolean, refunded?: number, alreadyRefunded?: boolean}>}
+ */
+async function refundCreditsForFailure(predictionId, refundAmount = null) {
+  try {
+    // Get video details
+    const { rows } = await pool.query(
+      "SELECT email, cost_credits, refunded FROM videos WHERE prediction_id = $1",
+      [predictionId]
+    );
+    
+    if (!rows[0]) {
+      console.log(`No video found for prediction ${predictionId}`);
+      return { ok: false };
+    }
+    
+    const { email, cost_credits, refunded } = rows[0];
+    
+    // Check if already refunded
+    if (refunded) {
+      console.log(`Credits already refunded for prediction ${predictionId}`);
+      return { ok: true, alreadyRefunded: true };
+    }
+    
+    // Determine refund amount
+    const amount = refundAmount || cost_credits || 0;
+    if (amount <= 0) {
+      console.log(`No credits to refund for prediction ${predictionId}`);
+      return { ok: true, refunded: 0 };
+    }
+    
+    // Refund credits and mark as refunded
+    await pool.query("BEGIN");
+    
+    await pool.query(
+      "UPDATE users SET balance = balance + $1 WHERE email = $2",
+      [amount, email]
+    );
+    
+    await pool.query(
+      "UPDATE videos SET refunded = true WHERE prediction_id = $1",
+      [predictionId]
+    );
+    
+    await pool.query("COMMIT");
+    
+    console.log(`✅ Refunded ${amount} credits to ${email} for failed prediction ${predictionId}`);
+    return { ok: true, refunded: amount };
+    
+  } catch (err) {
+    try {
+      await pool.query("ROLLBACK");
+    } catch {}
+    console.error(`Failed to refund credits for prediction ${predictionId}:`, err);
+    return { ok: false, error: err.message };
   }
 }
 
@@ -954,7 +1017,7 @@ app.post("/api/dub-upload", auth, (req, res) => {
         const videoUrl = `${base}/${key}`;
 
         const prediction = await createHeygenPrediction({ videoUrl, outputLanguage });
-        await upsertVideo({ email, predictionId: prediction.id, status: prediction.status, inputUrl: videoUrl });
+        await upsertVideo({ email, predictionId: prediction.id, status: prediction.status, inputUrl: videoUrl, costCredits: cost, type: 'video_translation' });
 
         res.json({
           id: prediction.id,
@@ -964,6 +1027,23 @@ app.post("/api/dub-upload", auth, (req, res) => {
         });
       } catch (e) {
         console.error(e);
+        
+        // Refund credits if generation failed after charging
+        try {
+          const email = req.user?.email;
+          const seconds = Math.max(1, Number(secondsField || 0));
+          const refundAmount = Math.max(1, Math.ceil(seconds)) * CREDITS_PER_SECOND;
+          if (email && refundAmount > 0) {
+            await pool.query(
+              "UPDATE users SET balance = balance + $1 WHERE email = $2",
+              [refundAmount, email]
+            );
+            console.log(`Refunded ${refundAmount} credits to ${email} due to upload/generation error`);
+          }
+        } catch (refundErr) {
+          console.error("Failed to refund credits:", refundErr);
+        }
+        
         res.status(e.statusCode || 500).json({ error: e?.message || "Upload/Start failed" });
       }
     });
@@ -1005,6 +1085,11 @@ app.get("/api/dub/:id", auth, asyncHandler(async (req, res) => {
 
     try {
       await upsertVideo({ email: req.user.email, predictionId: predictionId, status: prediction.status, outputUrl });
+      
+      // Automatically refund credits if prediction failed
+      if (prediction.status === "failed" || prediction.status === "canceled") {
+        await refundCreditsForFailure(predictionId);
+      }
     } catch (e) {
       console.log("video upsert failed", e?.message || e);
     }
@@ -1369,6 +1454,9 @@ app.get("/api/tiktok-captions/:jobId", auth, asyncHandler(async (req, res) => {
        WHERE prediction_id = $2`,
       [prediction.status, jobId]
     );
+    
+    // Automatically refund credits for failed generation
+    await refundCreditsForFailure(jobId);
   }
 
   res.json({
@@ -1597,6 +1685,9 @@ app.get("/api/kling-video/:jobId", auth, asyncHandler(async (req, res) => {
        WHERE prediction_id = $2`,
       [prediction.status, jobId]
     );
+    
+    // Automatically refund credits for failed generation
+    await refundCreditsForFailure(jobId);
   }
 
   res.json({
