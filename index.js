@@ -1520,7 +1520,7 @@ app.post("/api/kling-video", auth, (req, res) => {
         }
 
         const prediction = await klingReplicate.predictions.create({
-          version: "afa648db8ee32bfdfd939f96ad948e0ffb92dc78ee5fe5d6f68dc2937a13b7e4", // kwaivgi/kling-v2.5-turbo-pro
+          model: "kwaivgi/kling-v2.5-turbo-pro",
           input: input
         });
 
