@@ -1510,17 +1510,17 @@ app.post("/api/kling-video", auth, (req, res) => {
         
         const input = {
           prompt: prompt,
-          duration: duration || "10",
+          duration: parseInt(duration) || 10,
           aspect_ratio: aspectRatio || "16:9"
         };
 
         // Add image if in image mode
         if (mode === "image" && imageUrl) {
-          input.image = imageUrl;
+          input.start_image = imageUrl;
         }
 
         const prediction = await klingReplicate.predictions.create({
-          model: "kwaivgi/kling-v2.5-turbo-pro",
+          version: "939cd1851c5b112f284681b57ee9b0f36d0f913ba97de5845a7eef92d52837df",
           input: input
         });
 
