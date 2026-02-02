@@ -1384,7 +1384,7 @@ app.get("/api/tiktok-captions/:jobId", auth, asyncHandler(async (req, res) => {
 /**
  * POST /api/kling-video
  * Generate AI video from text or image
- * Cost: 15 credits per second (5s = 75 credits, 10s = 150 credits)
+ * Cost: 20 credits per second (5s = 100 credits, 10s = 200 credits)
  */
 app.post("/api/kling-video", auth, (req, res) => {
   try {
@@ -1396,7 +1396,7 @@ app.post("/api/kling-video", auth, (req, res) => {
     requireEnv("S3_BUCKET", S3_BUCKET);
     requireEnv("PUBLIC_BASE_URL", PUBLIC_BASE_URL);
 
-    const KLING_COST_PER_SECOND = 15;
+    const KLING_COST_PER_SECOND = 20;
     const bb = Busboy({
       headers: req.headers,
       limits: {
