@@ -1384,7 +1384,7 @@ app.get("/api/tiktok-captions/:jobId", auth, asyncHandler(async (req, res) => {
 /**
  * POST /api/kling-video
  * Generate AI video from text or image
- * Cost: 100 credits per video
+ * Cost: 15 credits per second (5s = 75 credits, 10s = 150 credits)
  */
 app.post("/api/kling-video", auth, (req, res) => {
   try {
@@ -1396,7 +1396,7 @@ app.post("/api/kling-video", auth, (req, res) => {
     requireEnv("S3_BUCKET", S3_BUCKET);
     requireEnv("PUBLIC_BASE_URL", PUBLIC_BASE_URL);
 
-    const KLING_COST = 100;
+    const KLING_COST_PER_SECOND = 15;
     const bb = Busboy({
       headers: req.headers,
       limits: {
@@ -1447,6 +1447,10 @@ app.post("/api/kling-video", auth, (req, res) => {
           return res.status(400).json({ error: "Image is required for image-to-video mode" });
         }
 
+        // Calculate cost based on duration (15 credits per second)
+        const videoDuration = parseInt(duration) || 10;
+        const KLING_COST = videoDuration * KLING_COST_PER_SECOND;
+
         // Check user balance
         const balRes = await pool.query(
           "SELECT balance FROM users WHERE email = $1",
@@ -1473,7 +1477,7 @@ app.post("/api/kling-video", auth, (req, res) => {
           [KLING_COST, email]
         );
 
-        console.log(`Deducted ${KLING_COST} credits from ${email}`);
+        console.log(`Deducted ${KLING_COST} credits from ${email} for ${videoDuration}s video`);
 
         // Upload image to S3 if needed
         let imageUrl = null;
@@ -1539,11 +1543,13 @@ app.post("/api/kling-video", auth, (req, res) => {
         
         // Refund credits if generation failed after charging
         try {
+          const videoDuration = parseInt(fields.duration) || 10;
+          const refundAmount = videoDuration * KLING_COST_PER_SECOND;
           await pool.query(
             "UPDATE users SET balance = balance + $1 WHERE email = $2",
-            [KLING_COST, email]
+            [refundAmount, email]
           );
-          console.log(`Refunded ${KLING_COST} credits to ${email} due to error`);
+          console.log(`Refunded ${refundAmount} credits to ${email} due to error`);
         } catch (refundErr) {
           console.error("Failed to refund credits:", refundErr);
         }
