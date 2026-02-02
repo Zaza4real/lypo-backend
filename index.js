@@ -1377,3 +1377,224 @@ app.get("/api/tiktok-captions/:jobId", auth, asyncHandler(async (req, res) => {
   });
 }));
 
+// ========================================
+// KLING AI VIDEO GENERATOR API
+// ========================================
+
+/**
+ * POST /api/kling-video
+ * Generate AI video from text or image
+ * Cost: 100 credits per video
+ */
+app.post("/api/kling-video", auth, (req, res) => {
+  try {
+    requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
+    
+    requireEnv("S3_ENDPOINT", S3_ENDPOINT);
+    requireEnv("S3_ACCESS_KEY_ID", S3_ACCESS_KEY_ID);
+    requireEnv("S3_SECRET_ACCESS_KEY", S3_SECRET_ACCESS_KEY);
+    requireEnv("S3_BUCKET", S3_BUCKET);
+    requireEnv("PUBLIC_BASE_URL", PUBLIC_BASE_URL);
+
+    const KLING_COST = 100;
+    const bb = Busboy({
+      headers: req.headers,
+      limits: {
+        fileSize: 10 * 1024 * 1024, // 10MB for images
+        files: 1
+      }
+    });
+
+    const fields = {};
+    let imageFile = null;
+    let imageBuffer = null;
+
+    bb.on("field", (name, val) => {
+      fields[name] = val;
+    });
+
+    bb.on("file", (name, file, info) => {
+      if (name === "image") {
+        const chunks = [];
+        file.on("data", chunk => chunks.push(chunk));
+        file.on("end", () => {
+          imageBuffer = Buffer.concat(chunks);
+          imageFile = {
+            buffer: imageBuffer,
+            filename: info.filename || `image_${Date.now()}.png`,
+            mimetype: info.mimeType || "image/png"
+          };
+        });
+      } else {
+        file.resume(); // Drain unwanted files
+      }
+    });
+
+    bb.on("finish", async () => {
+      try {
+        const { email } = req.user;
+        const { prompt, mode, duration, aspectRatio } = fields;
+
+        if (!prompt) {
+          return res.status(400).json({ error: "Prompt is required" });
+        }
+
+        if (mode !== "text" && mode !== "image") {
+          return res.status(400).json({ error: "Invalid mode" });
+        }
+
+        if (mode === "image" && !imageFile) {
+          return res.status(400).json({ error: "Image is required for image-to-video mode" });
+        }
+
+        // Check user balance
+        const balRes = await pool.query(
+          "SELECT balance FROM users WHERE email = $1",
+          [email]
+        );
+        
+        if (!balRes.rows.length) {
+          return res.status(404).json({ error: "USER_NOT_FOUND" });
+        }
+
+        const currentBalance = balRes.rows[0].balance || 0;
+        
+        if (currentBalance < KLING_COST) {
+          return res.status(402).json({ 
+            error: "INSUFFICIENT_BALANCE",
+            required: KLING_COST,
+            current: currentBalance
+          });
+        }
+
+        // Deduct credits immediately
+        await pool.query(
+          "UPDATE users SET balance = balance - $1 WHERE email = $2",
+          [KLING_COST, email]
+        );
+
+        console.log(`Deducted ${KLING_COST} credits from ${email}`);
+
+        // Upload image to S3 if needed
+        let imageUrl = null;
+        
+        if (mode === "image" && imageFile) {
+          const s3 = new S3Client({
+            endpoint: S3_ENDPOINT,
+            region: "auto",
+            credentials: {
+              accessKeyId: S3_ACCESS_KEY_ID,
+              secretAccessKey: S3_SECRET_ACCESS_KEY
+            }
+          });
+
+          const key = `kling-inputs/${Date.now()}_${imageFile.filename}`;
+          
+          await s3.send(new PutObjectCommand({
+            Bucket: S3_BUCKET,
+            Key: key,
+            Body: imageFile.buffer,
+            ContentType: imageFile.mimetype
+          }));
+
+          imageUrl = `${PUBLIC_BASE_URL}/${key}`;
+          console.log(`Uploaded input image: ${imageUrl}`);
+        }
+
+        // Call Kling API via Replicate
+        const klingReplicate = new Replicate({ auth: REPLICATE_API_TOKEN });
+        
+        const input = {
+          prompt: prompt,
+          duration: duration || "10",
+          aspect_ratio: aspectRatio || "16:9"
+        };
+
+        // Add image if in image mode
+        if (mode === "image" && imageUrl) {
+          input.image = imageUrl;
+        }
+
+        const prediction = await klingReplicate.predictions.create({
+          version: "afa648db8ee32bfdfd939f96ad948e0ffb92dc78ee5fe5d6f68dc2937a13b7e4", // kwaivgi/kling-v2.5-turbo-pro
+          input: input
+        });
+
+        console.log("Kling prediction created:", prediction.id);
+
+        // Store in database
+        await pool.query(
+          `INSERT INTO videos (email, prediction_id, status, source_url, credits_used, tool) 
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [email, prediction.id, prediction.status, imageUrl, KLING_COST, 'kling_video']
+        );
+
+        res.json({
+          jobId: prediction.id,
+          status: prediction.status
+        });
+
+      } catch (e) {
+        console.error("Kling video error:", e);
+        
+        // Refund credits if generation failed after charging
+        try {
+          await pool.query(
+            "UPDATE users SET balance = balance + $1 WHERE email = $2",
+            [KLING_COST, email]
+          );
+          console.log(`Refunded ${KLING_COST} credits to ${email} due to error`);
+        } catch (refundErr) {
+          console.error("Failed to refund credits:", refundErr);
+        }
+
+        res.status(500).json({ error: e?.message || "Video generation failed" });
+      }
+    });
+
+    req.pipe(bb);
+
+  } catch (e) {
+    console.error("Kling video error:", e);
+    res.status(e.statusCode || 500).json({ error: e?.message || "Internal error" });
+  }
+});
+
+/**
+ * GET /api/kling-video/:jobId
+ * Check status of video generation
+ */
+app.get("/api/kling-video/:jobId", auth, asyncHandler(async (req, res) => {
+  const { jobId } = req.params;
+
+  // Query Replicate directly
+  requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
+  const replicate = new Replicate({ auth: REPLICATE_API_TOKEN });
+  
+  const prediction = await replicate.predictions.get(jobId);
+
+  // Update database with latest status and output
+  if (prediction.status === 'succeeded' && prediction.output) {
+    const outputUrl = Array.isArray(prediction.output) ? prediction.output[0] : prediction.output;
+    
+    await pool.query(
+      `UPDATE videos 
+       SET status = $1, output_url = $2, updated_at = now() 
+       WHERE prediction_id = $3`,
+      [prediction.status, outputUrl, jobId]
+    );
+  } else if (prediction.status === 'failed' || prediction.status === 'canceled') {
+    await pool.query(
+      `UPDATE videos 
+       SET status = $1, updated_at = now() 
+       WHERE prediction_id = $2`,
+      [prediction.status, jobId]
+    );
+  }
+
+  res.json({
+    status: prediction.status,
+    output: prediction.output
+  });
+}));
+
