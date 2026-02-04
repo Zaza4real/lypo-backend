@@ -14,6 +14,7 @@ import { promises as fs } from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import os from "os";
+import sharp from "sharp";
 
 // Setup FFmpeg path
 ffmpeg.setFfmpegPath(ffmpegPath.path);
@@ -140,6 +141,30 @@ async function checkFFmpegAvailable() {
     ffmpegAvailable = false;
     console.warn('⚠️ FFmpeg not available:', error.message);
     return false;
+  }
+}
+
+/* ---------------------------
+   Helper: Convert HEIC/HEIF images to JPEG
+   This fixes iPhone images that use HEIC format
+---------------------------- */
+async function convertHEICtoJPEG(imageBuffer, originalFilename) {
+  try {
+    console.log(`🖼️  Converting HEIC image to JPEG: ${originalFilename}`);
+    
+    // Use sharp to convert HEIC to JPEG
+    const jpegBuffer = await sharp(imageBuffer)
+      .jpeg({ quality: 90, mozjpeg: true }) // High quality JPEG
+      .toBuffer();
+    
+    console.log(`✅ HEIC conversion successful: ${originalFilename}`);
+    console.log(`   Original: ${(imageBuffer.length / 1024).toFixed(2)} KB`);
+    console.log(`   JPEG: ${(jpegBuffer.length / 1024).toFixed(2)} KB`);
+    
+    return jpegBuffer;
+  } catch (error) {
+    console.error('❌ HEIC conversion error:', error.message);
+    throw new Error(`Failed to convert HEIC image: ${error.message}`);
   }
 }
 
@@ -2194,6 +2219,32 @@ app.post("/api/kling-video", auth, (req, res) => {
         let imageUrl = null;
         
         if (mode === "image" && imageFile) {
+          // Convert HEIC to JPEG if needed
+          let finalBuffer = imageFile.buffer;
+          let finalMimetype = imageFile.mimetype;
+          let finalFilename = imageFile.filename;
+          
+          // Check if image is HEIC/HEIF format
+          const isHEIC = imageFile.mimetype?.toLowerCase().includes('heic') || 
+                         imageFile.mimetype?.toLowerCase().includes('heif') ||
+                         imageFile.filename?.toLowerCase().endsWith('.heic') ||
+                         imageFile.filename?.toLowerCase().endsWith('.heif');
+          
+          if (isHEIC) {
+            try {
+              console.log('🔄 Detected HEIC image, converting to JPEG...');
+              finalBuffer = await convertHEICtoJPEG(imageFile.buffer, imageFile.filename);
+              finalMimetype = 'image/jpeg';
+              finalFilename = imageFile.filename.replace(/\.(heic|heif)$/i, '.jpg');
+              console.log('✅ HEIC converted to JPEG successfully');
+            } catch (conversionError) {
+              console.error('❌ HEIC conversion failed:', conversionError.message);
+              return res.status(400).json({ 
+                error: "Failed to convert HEIC image. Please convert to JPG/PNG first." 
+              });
+            }
+          }
+          
           const s3 = new S3Client({
             endpoint: S3_ENDPOINT,
             region: "auto",
@@ -2203,13 +2254,13 @@ app.post("/api/kling-video", auth, (req, res) => {
             }
           });
 
-          const key = `kling-inputs/${Date.now()}_${imageFile.filename}`;
+          const key = `kling-inputs/${Date.now()}_${finalFilename}`;
           
           await s3.send(new PutObjectCommand({
             Bucket: S3_BUCKET,
             Key: key,
-            Body: imageFile.buffer,
-            ContentType: imageFile.mimetype
+            Body: finalBuffer,
+            ContentType: finalMimetype
           }));
 
           imageUrl = `${PUBLIC_BASE_URL}/${key}`;
