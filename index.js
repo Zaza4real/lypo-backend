@@ -1844,11 +1844,17 @@ app.get("/api/tiktok-captions/:jobId", auth, asyncHandler(async (req, res) => {
     
     // Automatically refund credits for failed generation
     await refundCreditsForFailure(jobId);
+    
+    // Log the error for debugging
+    console.error(`❌ TikTok captions job ${jobId} failed:`, prediction.error || 'No error details');
   }
 
   res.json({
     status: prediction.status,
-    output: prediction.output
+    output: prediction.output,
+    error: prediction.error || null,     // Include error details if failed
+    logs: prediction.logs || null,       // Include logs for debugging
+    progress: prediction.progress || null // Include progress if available
   });
 }));
 
