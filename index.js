@@ -1131,7 +1131,7 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
     
     // Check user balance
     const balanceQuery = await pool.query(
-      "SELECT credits FROM users WHERE email = $1",
+      "SELECT balance FROM users WHERE email = $1",
       [userEmail]
     );
     
@@ -1139,7 +1139,7 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
       return res.status(404).json({ error: "User not found" });
     }
     
-    const currentBalance = balanceQuery.rows[0].credits || 0;
+    const currentBalance = balanceQuery.rows[0].balance || 0;
     
     if (currentBalance < cost) {
       console.log(`❌ Insufficient balance: ${currentBalance} < ${cost}`);
@@ -1152,7 +1152,7 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
     
     // Deduct credits immediately
     await pool.query(
-      "UPDATE users SET credits = credits - $1 WHERE email = $2",
+      "UPDATE users SET balance = balance - $1 WHERE email = $2",
       [cost, userEmail]
     );
     
@@ -1231,12 +1231,12 @@ app.get("/api/voiceover/status/:jobId", auth, asyncHandler(async (req, res) => {
     
     // Get user's current balance
     const balanceQuery = await pool.query(
-      "SELECT credits FROM users WHERE email = $1",
+      "SELECT balance FROM users WHERE email = $1",
       [userEmail]
     );
     
     const currentBalance = balanceQuery.rows.length > 0 
-      ? balanceQuery.rows[0].credits 
+      ? balanceQuery.rows[0].balance 
       : 0;
     
     // Store output URL in database
