@@ -1753,24 +1753,23 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
         // Using autocaption - adds karaoke-style captions to video (perfect for TikTok!)
         const tiktokReplicate = new Replicate({ auth: REPLICATE_API_TOKEN });
         
-        // Create Replicate prediction for captions
-        // RESTORED: Original working parameters with null dimensions
-        console.log("🎬 Creating TikTok captions for:", videoUrl);
+        // SWITCHED TO NEW MODEL: shreejalmaharjan-27/tiktok-short-captions
+        // This model uses Whisper and is more reliable than fictions-ai/autocaption
+        console.log("🎬 Creating TikTok captions with new model:", videoUrl);
         
         const prediction = await tiktokReplicate.predictions.create({
-          version: "18a45ff0d95feb4449d192bbdc06b4a6df168fa33def76dfc51b78ae224b599b",
+          version: "46bf1c12c77ad1782d6f87828d4d8ba4d48646b8e1271b490cb9e95ccdbc4504",
           input: {
-            video_file_input: videoUrl,
-            font_size: 6,
-            subs_position: "bottom",
-            max_chars: 16,
-            output_video_format: "mp4",
-            video_width: null,   // null = auto-detect (REQUIRED for model to work)
-            video_height: null   // null = auto-detect (REQUIRED for model to work)
+            video: videoUrl,              // Note: parameter name is "video", not "video_file_input"
+            caption_size: 30,             // Max words per caption window
+            highlight_color: "#8B5CF6",   // Purple highlight (LYPO brand color)
+            model: "large-v3",            // Whisper model size
+            language: "auto"              // Auto-detect language
           }
         });
         
-        console.log("📋 Prediction ID:", prediction.id);
+        console.log("✅ Prediction ID:", prediction.id);
+        console.log("🆕 Using new TikTok captions model (Whisper-based)");
 
         // Save to videos table for dashboard history
         await pool.query(
