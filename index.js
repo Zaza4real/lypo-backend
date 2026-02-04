@@ -885,7 +885,7 @@ app.post("/api/stripe/create-checkout-session", auth, asyncHandler(async (req, r
   const session = await stripe.checkout.sessions.create({
     mode: "payment",
     customer_email: email,
-    payment_method_types: ['card', 'google_pay', 'apple_pay', 'link'],
+    payment_method_types: ['card'],
     line_items: [
       {
         price_data: {
@@ -898,7 +898,13 @@ app.post("/api/stripe/create-checkout-session", auth, asyncHandler(async (req, r
     ],
     metadata: { email, lypos: String(lypos) },
     success_url: `${FRONTEND_URL}/dashboard.html?paid=1&session_id={CHECKOUT_SESSION_ID}`,
-    cancel_url: `${FRONTEND_URL}/dashboard.html?paid=0`
+    cancel_url: `${FRONTEND_URL}/dashboard.html?paid=0`,
+    // Enable Link and digital wallets (Google Pay, Apple Pay)
+    payment_method_options: {
+      card: {
+        request_three_d_secure: 'automatic'
+      }
+    }
   });
 
   res.json({ url: session.url });
