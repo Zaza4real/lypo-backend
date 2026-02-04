@@ -113,24 +113,14 @@ app.set("trust proxy", 1);
    SECURITY & PERFORMANCE MIDDLEWARE
 ---------------------------- */
 
-// Security Headers (Helmet)
+// Security Headers (Helmet) - TEMPORARILY DISABLED FOR DEBUGGING
+// TODO: Re-enable after testing
+/*
 if (helmet) {
   app.use(helmet({
-    contentSecurityPolicy: {
-      directives: {
-        defaultSrc: ["'self'"],
-        scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'", "https://www.googletagmanager.com", "https://js.stripe.com"],
-        styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
-        imgSrc: ["'self'", "data:", "https:", "blob:"],
-        connectSrc: ["'self'", "https://api.replicate.com", "https://api.stripe.com", "https://lypo-backend.onrender.com"],
-        fontSrc: ["'self'", "https://fonts.gstatic.com", "data:"],
-        objectSrc: ["'none'"],
-        mediaSrc: ["'self'", "https:", "blob:"],
-        frameSrc: ["https://js.stripe.com", "https://hooks.stripe.com"],
-      },
-    },
+    contentSecurityPolicy: false, // Disabled temporarily
     hsts: {
-      maxAge: 31536000, // 1 year
+      maxAge: 31536000,
       includeSubDomains: true,
       preload: true
     },
@@ -138,17 +128,14 @@ if (helmet) {
     referrerPolicy: { policy: 'strict-origin-when-cross-origin' }
   }));
 } else {
-  // Manual security headers fallback
+*/
+  // Minimal security headers only
   app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
-    res.setHeader('X-XSS-Protection', '1; mode=block');
-    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
-    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-    res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
     next();
   });
-}
+// }
 
 // Compression (gzip/deflate)
 if (compression) {
@@ -161,77 +148,25 @@ if (compression) {
   }));
 }
 
-// XSS Protection
-if (xssClean) {
-  app.use(xssClean());
-}
+// XSS Protection - TEMPORARILY DISABLED FOR DEBUGGING
+// if (xssClean) {
+//   app.use(xssClean());
+// }
 
-// Rate Limiting
+// Rate Limiting - TEMPORARILY DISABLED FOR DEBUGGING
+// Will re-enable after confirming tools work
+/*
 if (rateLimit) {
-  // General API rate limit
   const apiLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 100, // Limit each IP to 100 requests per windowMs
+    windowMs: 15 * 60 * 1000,
+    max: 100,
     message: 'Too many requests from this IP, please try again later.',
     standardHeaders: true,
     legacyHeaders: false,
   });
-  
-  // Strict rate limit for auth endpoints
-  const authLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 10, // Limit each IP to 10 requests per windowMs
-    message: 'Too many authentication attempts, please try again later.',
-    skipSuccessfulRequests: true
-  });
-  
-  // Very strict for password reset
-  const resetLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000, // 1 hour
-    max: 3,
-    message: 'Too many password reset attempts, please try again later.'
-  });
-  
-  // Store limiters for use later
-  app.set('apiLimiter', apiLimiter);
-  app.set('authLimiter', authLimiter);
-  app.set('resetLimiter', resetLimiter);
-  
-  // Apply general rate limiting to all routes
   app.use('/api/', apiLimiter);
-} else {
-  // Manual rate limiting fallback
-  const requestCounts = new Map();
-  app.use((req, res, next) => {
-    const ip = req.ip || req.connection.remoteAddress;
-    const now = Date.now();
-    const windowMs = 15 * 60 * 1000; // 15 minutes
-    
-    if (!requestCounts.has(ip)) {
-      requestCounts.set(ip, []);
-    }
-    
-    const requests = requestCounts.get(ip).filter(time => now - time < windowMs);
-    
-    if (requests.length >= 100) {
-      return res.status(429).json({ error: 'Too many requests' });
-    }
-    
-    requests.push(now);
-    requestCounts.set(ip, requests);
-    
-    // Clean up old entries every 100 requests
-    if (requestCounts.size > 1000) {
-      for (const [key, times] of requestCounts.entries()) {
-        if (times.every(t => now - t > windowMs)) {
-          requestCounts.delete(key);
-        }
-      }
-    }
-    
-    next();
-  });
 }
+*/
 
 /* ---------------------------
    CORS
@@ -1355,6 +1290,10 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
     
     // Start Kokoro-82M TTS prediction (proven working model with 77M+ runs)
     console.log(`🚀 Starting Kokoro-82M TTS prediction...`);
+    console.log(`   Text length: ${text.trim().length} chars`);
+    console.log(`   Voice: ${voice}`);
+    console.log(`   Speed: ${speed}`);
+    
     const prediction = await replicate.predictions.create({
       version: "d54f71bdf7c92de56fbfb4d03119af18efef37d3a0fd34e12275b007d485e480", // Kokoro-82M
       input: {
@@ -1365,7 +1304,8 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
     });
     
     const jobId = prediction.id;
-    console.log(`✅ ElevenLabs v3 prediction created: ${jobId}`);
+    console.log(`✅ Kokoro-82M prediction created: ${jobId}`);
+    console.log(`   Initial status: ${prediction.status}`);
     
     // Store job info in database
     await pool.query(
@@ -1385,6 +1325,7 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
     
   } catch (error) {
     console.error("❌ Voiceover generation error:", error);
+    console.error("   Full error:", JSON.stringify(error, null, 2));
     res.status(500).json({ 
       error: error.message || "Failed to generate voiceover" 
     });
@@ -1403,7 +1344,15 @@ app.get("/api/voiceover/status/:jobId", auth, asyncHandler(async (req, res) => {
   });
   
   const prediction = await replicate.predictions.get(jobId);
-  console.log(`Status: ${prediction.status}`);
+  console.log(`📊 Job ${jobId} status: ${prediction.status}`);
+  
+  if (prediction.error) {
+    console.error(`❌ Prediction error:`, prediction.error);
+  }
+  
+  if (prediction.logs) {
+    console.log(`📝 Prediction logs:`, prediction.logs);
+  }
   
   // Update job status in database
   await pool.query(
