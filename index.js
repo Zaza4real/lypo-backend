@@ -8,6 +8,19 @@ import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import pg from "pg";
 import { Resend } from "resend";
+import ffmpeg from "fluent-ffmpeg";
+import ffmpegPath from "@ffmpeg-installer/ffmpeg";
+import { promises as fs } from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+import os from "os";
+
+// Setup FFmpeg path
+ffmpeg.setFfmpegPath(ffmpegPath.path);
+
+// Get __dirname in ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // Security and Performance imports (with fallbacks)
 let helmet, compression, rateLimit, xssClean;
@@ -103,6 +116,80 @@ async function sendCreditPurchaseEmail(email, credits, amountUsd, invoiceUrl) {
     console.log("✅ Credit purchase email sent to:", to);
   } catch (err) {
     console.error("❌ Resend credit purchase email error:", err);
+  }
+}
+
+/* ---------------------------
+   Helper: Convert video to standard H.264 MP4
+   This fixes iPhone HEVC/H.265 videos and other problematic formats
+---------------------------- */
+async function convertVideoToStandardMP4(inputBuffer, originalFilename) {
+  const tempDir = os.tmpdir();
+  const inputPath = path.join(tempDir, `input-${crypto.randomUUID()}-${originalFilename}`);
+  const outputPath = path.join(tempDir, `output-${crypto.randomUUID()}.mp4`);
+  
+  console.log(`🔄 Converting video to H.264 MP4...`);
+  console.log(`   Input: ${originalFilename}`);
+  
+  try {
+    // Write input buffer to temp file
+    await fs.writeFile(inputPath, inputBuffer);
+    
+    // Convert to standard H.264 MP4
+    await new Promise((resolve, reject) => {
+      ffmpeg(inputPath)
+        .videoCodec('libx264')           // H.264 codec (universally compatible)
+        .audioCodec('aac')                // AAC audio (universally compatible)
+        .outputOptions([
+          '-preset fast',                 // Fast encoding
+          '-crf 23',                      // Quality (lower = better, 23 is good)
+          '-movflags +faststart',         // Optimize for streaming
+          '-pix_fmt yuv420p',             // Color format (compatible)
+          '-vf scale=trunc(iw/2)*2:trunc(ih/2)*2' // Ensure even dimensions
+        ])
+        .output(outputPath)
+        .on('start', (cmd) => {
+          console.log(`   FFmpeg command: ${cmd}`);
+        })
+        .on('progress', (progress) => {
+          if (progress.percent) {
+            console.log(`   Progress: ${Math.round(progress.percent)}%`);
+          }
+        })
+        .on('end', () => {
+          console.log('✅ Video conversion complete');
+          resolve();
+        })
+        .on('error', (err) => {
+          console.error('❌ FFmpeg conversion error:', err.message);
+          reject(new Error(`Video conversion failed: ${err.message}`));
+        })
+        .run();
+    });
+    
+    // Read converted video
+    const convertedBuffer = await fs.readFile(outputPath);
+    
+    // Cleanup temp files
+    try {
+      await fs.unlink(inputPath);
+      await fs.unlink(outputPath);
+    } catch (cleanupErr) {
+      console.warn('⚠️ Temp file cleanup warning:', cleanupErr.message);
+    }
+    
+    console.log(`✅ Converted video size: ${(convertedBuffer.length / 1024 / 1024).toFixed(2)} MB`);
+    return convertedBuffer;
+    
+  } catch (error) {
+    // Cleanup on error
+    try {
+      await fs.unlink(inputPath).catch(() => {});
+      await fs.unlink(outputPath).catch(() => {});
+    } catch (cleanupErr) {
+      // Ignore cleanup errors
+    }
+    throw error;
   }
 }
 
@@ -1747,21 +1834,39 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
           });
         }
 
-        const body = Buffer.concat(chunks);
+        let body = Buffer.concat(chunks);
         if (!body.length) {
           return res.status(400).json({ error: "Empty upload or file too large" });
         }
 
-        // Upload to S3
         const original = fileInfo.filename || "video.mp4";
-        const ext = (original.split(".").pop() || "mp4").toLowerCase();
-        const key = `tiktok-uploads/${crypto.randomUUID()}.${ext}`;
+        console.log(`📹 Original video: ${original} (${(body.length / 1024 / 1024).toFixed(2)} MB)`);
+
+        // Convert video to standard H.264 MP4 (fixes iPhone HEVC videos)
+        try {
+          console.log('🔄 Converting video to H.264 MP4 for compatibility...');
+          body = await convertVideoToStandardMP4(body, original);
+          console.log(`✅ Conversion successful (${(body.length / 1024 / 1024).toFixed(2)} MB)`);
+        } catch (conversionError) {
+          console.error('❌ Video conversion failed:', conversionError.message);
+          // Refund credits on conversion failure
+          await pool.query(
+            "UPDATE users SET balance = balance + $1 WHERE email = $2",
+            [TIKTOK_COST, email]
+          );
+          return res.status(400).json({ 
+            error: "Video format incompatible. Please try converting your video using CloudConvert.com or similar tool to standard MP4 (H.264)." 
+          });
+        }
+
+        // Upload converted video to S3
+        const key = `tiktok-uploads/${crypto.randomUUID()}.mp4`; // Always .mp4 after conversion
 
         await s3.send(new PutObjectCommand({
           Bucket: S3_BUCKET,
           Key: key,
           Body: body,
-          ContentType: fileInfo.mimeType || "video/mp4"
+          ContentType: "video/mp4"
         }));
 
         const base = PUBLIC_BASE_URL.replace(/\/$/, "");
