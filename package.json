@@ -17,7 +17,12 @@
     "jsonwebtoken": "^9.0.2",
     "bcryptjs": "^2.4.3",
     "pg": "^8.11.5",
-    "resend": "^4.0.0"
+    "resend": "^4.0.0",
+    "helmet": "^7.1.0",
+    "compression": "^1.7.4",
+    "express-rate-limit": "^7.1.5",
+    "express-validator": "^7.0.1",
+    "xss-clean": "^0.1.4"
   },
   "description": "",
   "main": "index.js",

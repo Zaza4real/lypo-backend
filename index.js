@@ -9,6 +9,17 @@ import bcrypt from "bcryptjs";
 import pg from "pg";
 import { Resend } from "resend";
 
+// Security and Performance imports (with fallbacks)
+let helmet, compression, rateLimit, xssClean;
+try {
+  helmet = (await import("helmet")).default;
+  compression = (await import("compression")).default;
+  rateLimit = (await import("express-rate-limit")).rateLimit;
+  xssClean = (await import("xss-clean")).default;
+} catch (err) {
+  console.warn("⚠️ Some security packages not installed. Run: npm install");
+}
+
 
 // async wrapper for express routes
 function asyncHandler(fn){
@@ -98,6 +109,129 @@ async function sendCreditPurchaseEmail(email, credits, amountUsd, invoiceUrl) {
 const app = express();
 app.set("trust proxy", 1);
 
+/* ---------------------------
+   SECURITY & PERFORMANCE MIDDLEWARE
+---------------------------- */
+
+// Security Headers (Helmet)
+if (helmet) {
+  app.use(helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'", "https://www.googletagmanager.com", "https://js.stripe.com"],
+        styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+        imgSrc: ["'self'", "data:", "https:", "blob:"],
+        connectSrc: ["'self'", "https://api.replicate.com", "https://api.stripe.com", "https://lypo-backend.onrender.com"],
+        fontSrc: ["'self'", "https://fonts.gstatic.com", "data:"],
+        objectSrc: ["'none'"],
+        mediaSrc: ["'self'", "https:", "blob:"],
+        frameSrc: ["https://js.stripe.com", "https://hooks.stripe.com"],
+      },
+    },
+    hsts: {
+      maxAge: 31536000, // 1 year
+      includeSubDomains: true,
+      preload: true
+    },
+    frameguard: { action: 'deny' },
+    referrerPolicy: { policy: 'strict-origin-when-cross-origin' }
+  }));
+} else {
+  // Manual security headers fallback
+  app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('X-XSS-Protection', '1; mode=block');
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
+    next();
+  });
+}
+
+// Compression (gzip/deflate)
+if (compression) {
+  app.use(compression({
+    filter: (req, res) => {
+      if (req.headers['x-no-compression']) return false;
+      return compression.filter(req, res);
+    },
+    level: 6 // Good balance between speed and compression
+  }));
+}
+
+// XSS Protection
+if (xssClean) {
+  app.use(xssClean());
+}
+
+// Rate Limiting
+if (rateLimit) {
+  // General API rate limit
+  const apiLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 100, // Limit each IP to 100 requests per windowMs
+    message: 'Too many requests from this IP, please try again later.',
+    standardHeaders: true,
+    legacyHeaders: false,
+  });
+  
+  // Strict rate limit for auth endpoints
+  const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 10, // Limit each IP to 10 requests per windowMs
+    message: 'Too many authentication attempts, please try again later.',
+    skipSuccessfulRequests: true
+  });
+  
+  // Very strict for password reset
+  const resetLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, // 1 hour
+    max: 3,
+    message: 'Too many password reset attempts, please try again later.'
+  });
+  
+  // Store limiters for use later
+  app.set('apiLimiter', apiLimiter);
+  app.set('authLimiter', authLimiter);
+  app.set('resetLimiter', resetLimiter);
+  
+  // Apply general rate limiting to all routes
+  app.use('/api/', apiLimiter);
+} else {
+  // Manual rate limiting fallback
+  const requestCounts = new Map();
+  app.use((req, res, next) => {
+    const ip = req.ip || req.connection.remoteAddress;
+    const now = Date.now();
+    const windowMs = 15 * 60 * 1000; // 15 minutes
+    
+    if (!requestCounts.has(ip)) {
+      requestCounts.set(ip, []);
+    }
+    
+    const requests = requestCounts.get(ip).filter(time => now - time < windowMs);
+    
+    if (requests.length >= 100) {
+      return res.status(429).json({ error: 'Too many requests' });
+    }
+    
+    requests.push(now);
+    requestCounts.set(ip, requests);
+    
+    // Clean up old entries every 100 requests
+    if (requestCounts.size > 1000) {
+      for (const [key, times] of requestCounts.entries()) {
+        if (times.every(t => now - t > windowMs)) {
+          requestCounts.delete(key);
+        }
+      }
+    }
+    
+    next();
+  });
+}
 
 /* ---------------------------
    CORS
@@ -493,6 +627,33 @@ app.options("*", (req, res) => {
 
 app.use(express.json({ limit: "2mb" }));
 
+// Input sanitization helper
+function sanitizeInput(str) {
+  if (typeof str !== 'string') return str;
+  // Remove potentially dangerous characters
+  return str
+    .replace(/<script[^>]*>.*?<\/script>/gi, '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/javascript:/gi, '')
+    .replace(/on\w+\s*=/gi, '')
+    .trim();
+}
+
+// Add cache control for API responses
+app.use((req, res, next) => {
+  // No cache for API endpoints
+  if (req.path.startsWith('/api/')) {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+  }
+  // Cache static assets for 1 year
+  else if (req.path.match(/\.(jpg|jpeg|png|gif|ico|css|js|woff|woff2|ttf|svg)$/)) {
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+  }
+  next();
+});
+
 
 app.get("/api/health", (req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
@@ -756,11 +917,25 @@ app.get("/api/account/payments", auth, asyncHandler(async (req, res) => {
 
 app.get("/api/account/videos", auth, asyncHandler(async (req, res) => {
   const email = normEmail(req.user.email);
-  const { rows } = await pool.query(
+  
+  // Get videos from videos table
+  const { rows: videoRows } = await pool.query(
     "SELECT prediction_id, status, input_url, output_url, type, cost_credits, created_at FROM videos WHERE email=$1 ORDER BY created_at DESC LIMIT 100",
     [email]
   );
-  res.json({ videos: rows });
+  
+  // Get voiceover jobs from jobs table
+  const { rows: jobRows } = await pool.query(
+    "SELECT job_id as prediction_id, status, NULL as input_url, output_url, tool as type, credits_used as cost_credits, created_at FROM jobs WHERE user_email=$1 AND tool='voiceover' ORDER BY created_at DESC LIMIT 100",
+    [email]
+  );
+  
+  // Combine and sort by created_at
+  const combined = [...videoRows, ...jobRows].sort((a, b) => 
+    new Date(b.created_at) - new Date(a.created_at)
+  ).slice(0, 100);
+  
+  res.json({ videos: combined });
 }));
 
 
