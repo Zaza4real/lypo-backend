@@ -885,6 +885,7 @@ app.post("/api/stripe/create-checkout-session", auth, asyncHandler(async (req, r
   const session = await stripe.checkout.sessions.create({
     mode: "payment",
     customer_email: email,
+    payment_method_types: ['card', 'google_pay', 'apple_pay', 'link'],
     line_items: [
       {
         price_data: {
