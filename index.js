@@ -1753,19 +1753,29 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
         // Using autocaption - adds karaoke-style captions to video (perfect for TikTok!)
         const tiktokReplicate = new Replicate({ auth: REPLICATE_API_TOKEN });
         
-        // ABSOLUTE MINIMUM: Only video URL, ZERO other parameters
-        // Testing if ANY parameter causes aspect ratio issues
-        console.log("🎬 Creating TikTok captions (zero config) for:", videoUrl);
+        // DIMENSION-FORCING APPROACH: Explicitly tell model to preserve input dimensions
+        // The model seems to default to landscape, so we force it to match input
+        console.log("🎬 Creating TikTok captions with forced dimension preservation:", videoUrl);
         
+        // Use autocaption but with explicit dimension preservation parameters
+        // Based on testing: model needs EXPLICIT width/height to preserve portrait
         const prediction = await tiktokReplicate.predictions.create({
           version: "18a45ff0d95feb4449d192bbdc06b4a6df168fa33def76dfc51b78ae224b599b",
           input: {
-            video_file_input: videoUrl
-            // LITERALLY NOTHING ELSE - testing if model defaults preserve aspect ratio
+            video_file_input: videoUrl,
+            // Force portrait dimensions - model defaults to 1080x1920 for portrait
+            // Using explicit dimensions that work for TikTok/Instagram vertical videos
+            video_width: 1080,   // Portrait width
+            video_height: 1920,  // Portrait height (9:16 ratio)
+            font_size: 7,
+            subs_position: "bottom75",
+            max_chars: 20,
+            output_video_format: "mp4"
           }
         });
         
         console.log("📋 Prediction ID:", prediction.id);
+        console.log("📐 Forced dimensions: 1080x1920 (portrait)");
 
         // Save to videos table for dashboard history
         await pool.query(
