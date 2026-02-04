@@ -1116,7 +1116,7 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
   try {
     requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
     
-    const { text, voice = "Rachel", style = 0.5, speed = 1.0 } = req.body;
+    const { text, voice = "af_bella", style = 0.5, speed = 1.0 } = req.body;
     const userEmail = req.user.email;
     
     if (!text || text.trim().length === 0) {
@@ -1164,17 +1164,14 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
       auth: REPLICATE_API_TOKEN,
     });
     
-    // Start ElevenLabs V3 prediction
-    console.log(`🚀 Starting ElevenLabs v3 prediction...`);
+    // Start Kokoro-82M TTS prediction (proven working model with 77M+ runs)
+    console.log(`🚀 Starting Kokoro-82M TTS prediction...`);
     const prediction = await replicate.predictions.create({
-      version: "0d75bf7169b6d9a7ca34087c5c0e54b96c721c0ea13c2ac2e87a9eecdef7d99e", // ElevenLabs v3
+      version: "d54f71bdf7c92de56fbfb4d03119af18efef37d3a0fd34e12275b007d485e480", // Kokoro-82M
       input: {
         text: text.trim(),
-        voice: voice,
-        stability: style, // 0-1 range, lower = more variable/expressive
-        similarity_boost: 0.75,
-        speed: speed, // 0.5 to 1.5
-        model_id: "eleven_turbo_v2_5" // Fast model
+        voice: voice, // Already in correct format (e.g., af_bella)
+        speed: speed, // 0.1 to 5.0
       },
     });
     
