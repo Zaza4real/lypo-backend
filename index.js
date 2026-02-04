@@ -534,6 +534,54 @@ try {
     }
   }
 
+  // Handle Apple Pay / Google Pay payments (payment_intent.succeeded)
+  if (event.type === "payment_intent.succeeded") {
+    const paymentIntent = event.data.object;
+    const email = paymentIntent.metadata?.email;
+    const lypos = Number(paymentIntent.metadata?.lypos || 0);
+    const amountUsd = Number(paymentIntent.amount || 0) / 100;
+    const paymentIntentId = paymentIntent.id;
+    
+    let invoiceUrl = null;
+    try {
+      if (paymentIntent.charges?.data?.[0]) {
+        invoiceUrl = paymentIntent.charges.data[0].receipt_url || null;
+      }
+    } catch (e) {
+      invoiceUrl = null;
+    }
+
+    if (email && lypos > 0) {
+      try {
+        // Check if already recorded to avoid duplicates
+        const existing = await pool.query(
+          "SELECT 1 FROM payments WHERE stripe_session_id=$1 LIMIT 1",
+          [paymentIntentId]
+        );
+        
+        if (existing.rows.length === 0) {
+          await recordPayment({ 
+            email, 
+            stripeSessionId: paymentIntentId, 
+            amountUsd, 
+            lypos, 
+            status: "completed", 
+            invoiceUrl 
+          });
+          await addBalance(email, lypos);
+          console.log("✅ Payment Intent processed + credited LYPOS:", { email, lypos, amountUsd });
+          
+          // Send email notification
+          await sendCreditPurchaseEmail(email, lypos, amountUsd, invoiceUrl);
+        } else {
+          console.log("⚠️ Payment Intent already processed:", paymentIntentId);
+        }
+      } catch (e) {
+        console.log("⚠️ Payment Intent webhook failed:", e?.message || e);
+      }
+    }
+  }
+
   res.json({ received: true });
 }));
 
@@ -873,6 +921,40 @@ app.get("/api/account/videos", auth, asyncHandler(async (req, res) => {
   res.json({ videos: combined });
 }));
 
+
+// ---- Stripe Payment Intent for Apple Pay / Google Pay
+app.post("/api/stripe/create-payment-intent", auth, asyncHandler(async (req, res) => {
+  const usd = Number(req.body?.usd || 0);
+  if (!Number.isFinite(usd) || usd <= 0) return res.status(400).json({ error: "Invalid usd" });
+
+  const email = req.user.email;
+  const lypos = Math.round(usd * LYPOS_PER_USD);
+
+  try {
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: Math.round(usd * 100), // Convert to cents
+      currency: 'usd',
+      customer_email: email,
+      description: `${lypos} LYPO Credits`,
+      metadata: {
+        email,
+        lypos: String(lypos),
+        usd: String(usd)
+      },
+      automatic_payment_methods: {
+        enabled: true,
+      },
+    });
+
+    res.json({ 
+      clientSecret: paymentIntent.client_secret,
+      paymentIntentId: paymentIntent.id 
+    });
+  } catch (error) {
+    console.error('❌ Payment Intent creation error:', error);
+    res.status(500).json({ error: error.message });
+  }
+}));
 
 // ---- Stripe checkout: buy LYPOS
 app.post("/api/stripe/create-checkout-session", auth, asyncHandler(async (req, res) => {
