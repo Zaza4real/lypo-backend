@@ -1696,7 +1696,7 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
 
     let fileInfo = null;
     let chunks = [];
-    let captionSettings = { size: 100, color: "#8B5CF6" }; // Defaults
+    let captionSettings = { size: 50, color: "#8B5CF6" }; // Defaults (max ~70 for stability)
 
     bb.on("field", (name, value) => {
       // Capture caption settings from form
