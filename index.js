@@ -166,28 +166,42 @@ async function convertVideoToStandardMP4(inputBuffer, originalFilename) {
     // Write input buffer to temp file
     await fs.writeFile(inputPath, inputBuffer);
     
-    // Convert to standard H.264 MP4
-    // iPhone videos often have extra streams (GPS, metadata) that cause errors
+    // Convert to standard H.264 MP4 with LOW MEMORY USAGE
+    // Optimized for Render's 512MB free tier
     await new Promise((resolve, reject) => {
-      ffmpeg(inputPath)
+      const command = ffmpeg(inputPath)
         .videoCodec('libx264')           // H.264 codec (universally compatible)
         .audioCodec('aac')                // AAC audio (universally compatible)
         .inputOptions([
-          '-ignore_unknown'               // Ignore unknown/problematic streams
+          '-ignore_unknown',              // Ignore unknown/problematic streams
+          '-analyzeduration 5000000',     // Reduce analysis time
+          '-probesize 5000000'            // Reduce probe size (saves memory)
         ])
         .outputOptions([
           '-map 0:v:0',                   // Map only first video stream
           '-map 0:a:0?',                  // Map first audio stream (optional)
-          '-preset fast',                 // Fast encoding
-          '-crf 23',                      // Quality (lower = better, 23 is good)
+          '-preset ultrafast',            // Fastest encoding (less memory)
+          '-crf 28',                      // Lower quality (saves memory, still good)
           '-movflags +faststart',         // Optimize for streaming
           '-pix_fmt yuv420p',             // Color format (compatible)
           '-vf scale=trunc(iw/2)*2:trunc(ih/2)*2', // Ensure even dimensions
-          '-max_muxing_queue_size 1024'   // Prevent muxing errors
+          '-max_muxing_queue_size 400',   // Lower buffer (less memory)
+          '-bufsize 1000k',               // Limit buffer size (saves memory)
+          '-threads 1',                   // Single thread (saves memory)
+          '-g 52'                         // Keyframe interval (saves memory)
         ])
-        .output(outputPath)
+        .output(outputPath);
+      
+      // Add timeout to prevent hanging (kills process after 90 seconds)
+      const timeout = setTimeout(() => {
+        command.kill('SIGKILL');
+        reject(new Error('Conversion timeout - video too large or server memory limited'));
+      }, 90000);
+      
+      command
         .on('start', (cmd) => {
           console.log(`   FFmpeg command: ${cmd}`);
+          console.log(`   Memory-optimized mode (ultrafast, CRF 28, 1 thread)`);
         })
         .on('progress', (progress) => {
           if (progress.percent) {
@@ -195,10 +209,12 @@ async function convertVideoToStandardMP4(inputBuffer, originalFilename) {
           }
         })
         .on('end', () => {
+          clearTimeout(timeout);
           console.log('✅ Video conversion complete');
           resolve();
         })
         .on('error', (err) => {
+          clearTimeout(timeout);
           console.error('❌ FFmpeg conversion error:', err.message);
           reject(new Error(`Video conversion failed: ${err.message}`));
         })
@@ -1901,26 +1917,40 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
         }
 
         const original = fileInfo.filename || "video.mp4";
-        console.log(`📹 Original video: ${original} (${(body.length / 1024 / 1024).toFixed(2)} MB)`);
+        const fileSizeMB = body.length / 1024 / 1024;
+        console.log(`📹 Original video: ${original} (${fileSizeMB.toFixed(2)} MB)`);
+
+        // Check if file is too large for conversion on free tier (>50MB risky)
+        const MAX_CONVERSION_SIZE = 50; // MB - Conservative for 512MB RAM
+        const shouldAttemptConversion = fileSizeMB <= MAX_CONVERSION_SIZE;
+        
+        if (!shouldAttemptConversion) {
+          console.warn(`⚠️ Video too large for conversion (${fileSizeMB.toFixed(2)} MB > ${MAX_CONVERSION_SIZE} MB)`);
+          console.warn(`⚠️ Using original video to prevent out-of-memory error`);
+        }
 
         // Convert video to standard H.264 MP4 (fixes iPhone HEVC videos)
         let conversionAttempted = false;
-        try {
-          console.log('🔄 Attempting video conversion to H.264 MP4...');
-          const convertedBody = await convertVideoToStandardMP4(body, original);
+        if (shouldAttemptConversion) {
+          try {
+            console.log('🔄 Attempting video conversion to H.264 MP4...');
+            const convertedBody = await convertVideoToStandardMP4(body, original);
           
-          // Check if conversion actually happened (not just returned original)
-          if (convertedBody !== body) {
-            body = convertedBody;
-            conversionAttempted = true;
-            console.log(`✅ Conversion successful (${(body.length / 1024 / 1024).toFixed(2)} MB)`);
-          } else {
-            console.warn('⚠️ Using original video (FFmpeg not available or conversion skipped)');
+            // Check if conversion actually happened (not just returned original)
+            if (convertedBody !== body) {
+              body = convertedBody;
+              conversionAttempted = true;
+              console.log(`✅ Conversion successful (${(body.length / 1024 / 1024).toFixed(2)} MB)`);
+            } else {
+              console.warn('⚠️ Using original video (FFmpeg not available or conversion skipped)');
+            }
+          } catch (conversionError) {
+            console.warn('⚠️ Video conversion failed, using original video:', conversionError.message);
+            // Don't fail - try with original video instead
+            // The Replicate model might handle it
           }
-        } catch (conversionError) {
-          console.warn('⚠️ Video conversion failed, using original video:', conversionError.message);
-          // Don't fail - try with original video instead
-          // The Replicate model might handle it
+        } else {
+          console.log('⚠️ Skipping conversion (file too large for 512MB RAM limit)');
         }
 
         // Upload video to S3 (converted or original)
