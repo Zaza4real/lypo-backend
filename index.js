@@ -1756,18 +1756,9 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
         const prediction = await tiktokReplicate.predictions.create({
           version: "18a45ff0d95feb4449d192bbdc06b4a6df168fa33def76dfc51b78ae224b599b", // fictions-ai/autocaption
           input: {
-            video_file_input: videoUrl,
-            font_size: 7.0,             // Default font size for videos (documentation default)
-            subs_position: "bottom75",  // Default position from docs
-            max_chars: 20,              // Default for videos (10 for reels)
-            output_video_format: "mp4", // Ensure mp4 output
-            kerning: -5,                // Default kerning from docs
-            opacity: 0,                 // Caption background opacity (0 = transparent)
-            MaxCaptionWindow: 2.5,      // Max time window for captions
-            stroke_width: 2.6,          // Default stroke width
-            color: "white",             // Default caption color
-            highlight_color: "yellow",  // Default highlight
-            stroke_color: "black"       // Default stroke/outline color
+            video_file_input: videoUrl
+            // NO other parameters - let model auto-detect and preserve EVERYTHING
+            // This ensures original aspect ratio, dimensions, and quality are maintained
           }
         });
 
