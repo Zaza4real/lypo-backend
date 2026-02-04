@@ -1106,6 +1106,169 @@ app.get("/api/dub/:id", auth, asyncHandler(async (req, res) => {
   }
 }));
 
+/* ---------------------------
+   VOICEOVER TOOL (ElevenLabs V3)
+   POST /api/voiceover/generate
+   GET  /api/voiceover/status/:jobId
+---------------------------- */
+
+app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
+  try {
+    requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
+    
+    const { text, voice = "Rachel", style = 0.5, speed = 1.0 } = req.body;
+    const userEmail = req.user.email;
+    
+    if (!text || text.trim().length === 0) {
+      return res.status(400).json({ error: "Text is required" });
+    }
+    
+    // Calculate cost: 50 credits per 1000 characters
+    const charCount = text.trim().length;
+    const cost = Math.ceil((charCount / 1000) * 50);
+    
+    console.log(`🎙️ Voiceover request from ${userEmail}: ${charCount} chars = ${cost} credits`);
+    
+    // Check user balance
+    const balanceQuery = await pool.query(
+      "SELECT credits FROM users WHERE email = $1",
+      [userEmail]
+    );
+    
+    if (balanceQuery.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    
+    const currentBalance = balanceQuery.rows[0].credits || 0;
+    
+    if (currentBalance < cost) {
+      console.log(`❌ Insufficient balance: ${currentBalance} < ${cost}`);
+      return res.status(402).json({ 
+        error: `Insufficient credits. Need ${cost}, have ${currentBalance}`,
+        required: cost,
+        current: currentBalance
+      });
+    }
+    
+    // Deduct credits immediately
+    await pool.query(
+      "UPDATE users SET credits = credits - $1 WHERE email = $2",
+      [cost, userEmail]
+    );
+    
+    const newBalance = currentBalance - cost;
+    console.log(`✅ Deducted ${cost} credits. New balance: ${newBalance}`);
+    
+    // Initialize Replicate
+    const replicate = new Replicate({
+      auth: REPLICATE_API_TOKEN,
+    });
+    
+    // Start ElevenLabs V3 prediction
+    console.log(`🚀 Starting ElevenLabs v3 prediction...`);
+    const prediction = await replicate.predictions.create({
+      version: "0d75bf7169b6d9a7ca34087c5c0e54b96c721c0ea13c2ac2e87a9eecdef7d99e", // ElevenLabs v3
+      input: {
+        text: text.trim(),
+        voice: voice,
+        stability: style, // 0-1 range, lower = more variable/expressive
+        similarity_boost: 0.75,
+        speed: speed, // 0.5 to 1.5
+        model_id: "eleven_turbo_v2_5" // Fast model
+      },
+    });
+    
+    const jobId = prediction.id;
+    console.log(`✅ ElevenLabs v3 prediction created: ${jobId}`);
+    
+    // Store job info in database
+    await pool.query(
+      `INSERT INTO jobs (job_id, user_email, status, tool, credits_used, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       ON CONFLICT (job_id) 
+       DO UPDATE SET status = $3, updated_at = NOW()`,
+      [jobId, userEmail, prediction.status, "voiceover", cost]
+    );
+    
+    res.json({ 
+      jobId, 
+      status: prediction.status,
+      cost,
+      remainingCredits: newBalance
+    });
+    
+  } catch (error) {
+    console.error("❌ Voiceover generation error:", error);
+    res.status(500).json({ 
+      error: error.message || "Failed to generate voiceover" 
+    });
+  }
+}));
+
+app.get("/api/voiceover/status/:jobId", auth, asyncHandler(async (req, res) => {
+  const { jobId } = req.params;
+  const userEmail = req.user.email;
+  
+  console.log(`📊 Checking voiceover status for job ${jobId}`);
+  
+  // Query Replicate directly
+  const replicate = new Replicate({
+    auth: REPLICATE_API_TOKEN,
+  });
+  
+  const prediction = await replicate.predictions.get(jobId);
+  console.log(`Status: ${prediction.status}`);
+  
+  // Update job status in database
+  await pool.query(
+    `UPDATE jobs SET status = $1, updated_at = NOW() WHERE job_id = $2`,
+    [prediction.status, jobId]
+  );
+  
+  // If completed successfully
+  if (prediction.status === "succeeded" && prediction.output) {
+    console.log(`✅ Voiceover completed: ${jobId}`);
+    
+    // Get user's current balance
+    const balanceQuery = await pool.query(
+      "SELECT credits FROM users WHERE email = $1",
+      [userEmail]
+    );
+    
+    const currentBalance = balanceQuery.rows.length > 0 
+      ? balanceQuery.rows[0].credits 
+      : 0;
+    
+    // Store output URL in database
+    await pool.query(
+      `UPDATE jobs SET output_url = $1 WHERE job_id = $2`,
+      [prediction.output, jobId]
+    );
+    
+    return res.json({
+      status: "completed",
+      audioUrl: prediction.output,
+      remainingCredits: currentBalance
+    });
+  }
+  
+  // If failed, refund credits
+  if (prediction.status === "failed" || prediction.status === "canceled") {
+    console.log(`❌ Voiceover failed: ${jobId}`);
+    await refundCreditsForFailure(jobId);
+    
+    return res.json({
+      status: "failed",
+      error: prediction.error || "Generation failed"
+    });
+  }
+  
+  // Still processing
+  res.json({
+    status: prediction.status
+  });
+}));
+
 const PORT = process.env.PORT || 3000;
 
 initDb()
