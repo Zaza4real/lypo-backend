@@ -1694,14 +1694,29 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
       limits: { fileSize: 200 * 1024 * 1024 } // 200MB
     });
 
+    const TIKTOK_COST = 50; // Fixed cost - defined at top level
+    const email = req.user.email; // User email from auth middleware
+    
     let fileInfo = null;
     let chunks = [];
-    let captionSettings = { size: 50, color: "#8B5CF6" }; // Defaults (max ~70 for stability)
+    let captionSettings = { 
+      size: 50, 
+      textColor: "#FFFFFF", 
+      highlightColor: "#8B5CF6" 
+    }; // Defaults
 
     bb.on("field", (name, value) => {
       // Capture caption settings from form
-      if (name === "caption_size") captionSettings.size = parseInt(value, 10) || 30;
-      if (name === "highlight_color") captionSettings.color = value || "#8B5CF6";
+      if (name === "caption_size") {
+        const size = parseInt(value, 10);
+        captionSettings.size = (size >= 15 && size <= 70) ? size : 50; // Validate range
+      }
+      if (name === "text_color") {
+        captionSettings.textColor = value || "#FFFFFF";
+      }
+      if (name === "highlight_color") {
+        captionSettings.highlightColor = value || "#8B5CF6";
+      }
     });
 
     bb.on("file", (name, file, info) => {
@@ -1719,10 +1734,6 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
     bb.on("finish", async () => {
       try {
         if (!fileInfo) return res.status(400).json({ error: "Missing video file (field name: video)" });
-
-        // Charge 50 credits (fixed cost)
-        const TIKTOK_COST = 50;
-        const email = req.user.email;
         const charge = await chargeBalance(email, TIKTOK_COST);
         
         if (!charge.ok && charge.code === "NO_USER") {
@@ -1760,25 +1771,33 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
         // Using autocaption - adds karaoke-style captions to video (perfect for TikTok!)
         const tiktokReplicate = new Replicate({ auth: REPLICATE_API_TOKEN });
         
-        // SWITCHED TO NEW MODEL: shreejalmaharjan-27/tiktok-short-captions
-        // This model uses Whisper and is more reliable than fictions-ai/autocaption
-        console.log("🎬 Creating TikTok captions with new model:", videoUrl);
-        console.log(`📏 Caption size: ${captionSettings.size}`);
-        console.log(`🎨 Highlight color: ${captionSettings.color}`);
+        // Create Replicate prediction with fictions-ai/autocaption
+        console.log(`🎬 TikTok captions: ${videoUrl}`);
+        console.log(`📏 Caption size: ${captionSettings.size} words`);
+        console.log(`📝 Text color: ${captionSettings.textColor}`);
+        console.log(`🎨 Highlight color: ${captionSettings.highlightColor}`);
         
+        // Map caption size (words) to max_chars (characters per line)
+        // 15 words ≈ 12 chars, 50 words ≈ 16 chars, 70 words ≈ 20 chars
+        const maxChars = Math.min(Math.max(Math.floor(12 + (captionSettings.size - 15) * 0.15), 12), 20);
+        
+        // NOTE: fictions-ai/autocaption currently doesn't support custom text/highlight colors
+        // These settings are stored for future compatibility or alternative models
         const prediction = await tiktokReplicate.predictions.create({
-          version: "46bf1c12c77ad1782d6f87828d4d8ba4d48646b8e1271b490cb9e95ccdbc4504",
+          version: "18a45ff0d95feb4449d192bbdc06b4a6df168fa33def76dfc51b78ae224b599b",
           input: {
-            video: videoUrl,                          // Video URL
-            caption_size: captionSettings.size,       // User-selected caption size
-            highlight_color: captionSettings.color,   // User-selected highlight color
-            model: "large-v3",                        // Whisper model size
-            language: "auto"                          // Auto-detect language
+            video_file_input: videoUrl,
+            font_size: 6,
+            subs_position: "bottom",
+            max_chars: maxChars,
+            output_video_format: "mp4",
+            video_width: null,  // Auto-detect dimensions
+            video_height: null  // Auto-detect dimensions
+            // text_color and highlight_color not yet supported by this model
           }
         });
         
-        console.log("✅ Prediction ID:", prediction.id);
-        console.log("🆕 Using new TikTok captions model (Whisper-based)");
+        console.log(`✅ Prediction ${prediction.id} created | max_chars: ${maxChars}`);
 
         // Save to videos table for dashboard history
         await pool.query(
