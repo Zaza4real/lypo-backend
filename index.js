@@ -1696,13 +1696,6 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
 
     let fileInfo = null;
     let chunks = [];
-    let videoDimensions = { width: null, height: null }; // Store detected dimensions from frontend
-
-    bb.on("field", (name, value) => {
-      // Capture video dimensions sent from frontend
-      if (name === "video_width") videoDimensions.width = parseInt(value, 10);
-      if (name === "video_height") videoDimensions.height = parseInt(value, 10);
-    });
 
     bb.on("file", (name, file, info) => {
       if (name !== "video") {
@@ -1760,30 +1753,21 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
         // Using autocaption - adds karaoke-style captions to video (perfect for TikTok!)
         const tiktokReplicate = new Replicate({ auth: REPLICATE_API_TOKEN });
         
-        // GUARANTEED ASPECT RATIO PRESERVATION
-        // Use exact dimensions detected by frontend
-        const width = videoDimensions.width || 1080;   // Default to portrait if not detected
-        const height = videoDimensions.height || 1920;
-        
-        console.log("🎬 Creating TikTok captions with EXACT input dimensions:", videoUrl);
-        console.log(`📐 Using dimensions: ${width}x${height} (from ${videoDimensions.width ? 'frontend detection' : 'defaults'})`);
+        // Create Replicate prediction for captions
+        console.log("🎬 Creating TikTok captions for:", videoUrl);
         
         const prediction = await tiktokReplicate.predictions.create({
           version: "18a45ff0d95feb4449d192bbdc06b4a6df168fa33def76dfc51b78ae224b599b",
           input: {
             video_file_input: videoUrl,
-            // Use EXACT input dimensions - guarantees output matches input
-            video_width: width,
-            video_height: height,
-            font_size: 7,
-            subs_position: "bottom75",
-            max_chars: 20,
+            font_size: 6,
+            subs_position: "bottom",
+            max_chars: 16,
             output_video_format: "mp4"
           }
         });
         
-        console.log("✅ Prediction ID:", prediction.id);
-        console.log(`✅ Aspect ratio preserved: ${width}x${height}`);
+        console.log("📋 Prediction ID:", prediction.id);
 
         // Save to videos table for dashboard history
         await pool.query(
