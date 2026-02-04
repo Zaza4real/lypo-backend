@@ -934,7 +934,7 @@ app.post("/api/stripe/create-payment-intent", auth, asyncHandler(async (req, res
     const paymentIntent = await stripe.paymentIntents.create({
       amount: Math.round(usd * 100), // Convert to cents
       currency: 'usd',
-      customer_email: email,
+      receipt_email: email, // Fixed: was customer_email, should be receipt_email
       description: `${lypos} LYPO Credits`,
       metadata: {
         email,
