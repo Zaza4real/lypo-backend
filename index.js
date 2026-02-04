@@ -1754,6 +1754,7 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
         const tiktokReplicate = new Replicate({ auth: REPLICATE_API_TOKEN });
         
         // Create Replicate prediction for captions
+        // RESTORED: Original working parameters with null dimensions
         console.log("🎬 Creating TikTok captions for:", videoUrl);
         
         const prediction = await tiktokReplicate.predictions.create({
@@ -1763,7 +1764,9 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
             font_size: 6,
             subs_position: "bottom",
             max_chars: 16,
-            output_video_format: "mp4"
+            output_video_format: "mp4",
+            video_width: null,   // null = auto-detect (REQUIRED for model to work)
+            video_height: null   // null = auto-detect (REQUIRED for model to work)
           }
         });
         
