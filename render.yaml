@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: lypo-backend
+    env: node
+    region: oregon
+    plan: free
+    buildCommand: |
+      apt-get update
+      apt-get install -y ffmpeg
+      npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: NODE_ENV
+        value: production

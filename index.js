@@ -120,10 +120,41 @@ async function sendCreditPurchaseEmail(email, credits, amountUsd, invoiceUrl) {
 }
 
 /* ---------------------------
+   Helper: Check if FFmpeg is available
+---------------------------- */
+let ffmpegAvailable = null;
+async function checkFFmpegAvailable() {
+  if (ffmpegAvailable !== null) return ffmpegAvailable;
+  
+  try {
+    await new Promise((resolve, reject) => {
+      ffmpeg.getAvailableFormats((err, formats) => {
+        if (err) reject(err);
+        else resolve(formats);
+      });
+    });
+    ffmpegAvailable = true;
+    console.log('✅ FFmpeg is available');
+    return true;
+  } catch (error) {
+    ffmpegAvailable = false;
+    console.warn('⚠️ FFmpeg not available:', error.message);
+    return false;
+  }
+}
+
+/* ---------------------------
    Helper: Convert video to standard H.264 MP4
    This fixes iPhone HEVC/H.265 videos and other problematic formats
 ---------------------------- */
 async function convertVideoToStandardMP4(inputBuffer, originalFilename) {
+  // Check if FFmpeg is available
+  const hasFFmpeg = await checkFFmpegAvailable();
+  if (!hasFFmpeg) {
+    console.warn('⚠️ FFmpeg not available, skipping conversion');
+    return inputBuffer; // Return original video without conversion
+  }
+  
   const tempDir = os.tmpdir();
   const inputPath = path.join(tempDir, `input-${crypto.randomUUID()}-${originalFilename}`);
   const outputPath = path.join(tempDir, `output-${crypto.randomUUID()}.mp4`);
@@ -694,6 +725,29 @@ app.use((req, res, next) => {
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "same-origin");
   res.setHeader("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
+  next();
+});
+
+// CORS Configuration
+app.use((req, res, next) => {
+  const allowedOrigins = [
+    'https://lypo.org',
+    'https://www.lypo.org',
+    'http://localhost:3000',
+    'http://localhost:5500',
+    'http://127.0.0.1:5500'
+  ];
+  
+  const origin = req.headers.origin;
+  if (allowedOrigins.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  }
+  
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Max-Age', '86400'); // 24 hours
+  
   next();
 });
 
@@ -1850,24 +1904,28 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
         console.log(`📹 Original video: ${original} (${(body.length / 1024 / 1024).toFixed(2)} MB)`);
 
         // Convert video to standard H.264 MP4 (fixes iPhone HEVC videos)
+        let conversionAttempted = false;
         try {
-          console.log('🔄 Converting video to H.264 MP4 for compatibility...');
-          body = await convertVideoToStandardMP4(body, original);
-          console.log(`✅ Conversion successful (${(body.length / 1024 / 1024).toFixed(2)} MB)`);
+          console.log('🔄 Attempting video conversion to H.264 MP4...');
+          const convertedBody = await convertVideoToStandardMP4(body, original);
+          
+          // Check if conversion actually happened (not just returned original)
+          if (convertedBody !== body) {
+            body = convertedBody;
+            conversionAttempted = true;
+            console.log(`✅ Conversion successful (${(body.length / 1024 / 1024).toFixed(2)} MB)`);
+          } else {
+            console.warn('⚠️ Using original video (FFmpeg not available or conversion skipped)');
+          }
         } catch (conversionError) {
-          console.error('❌ Video conversion failed:', conversionError.message);
-          // Refund credits on conversion failure
-          await pool.query(
-            "UPDATE users SET balance = balance + $1 WHERE email = $2",
-            [TIKTOK_COST, email]
-          );
-          return res.status(400).json({ 
-            error: "Video format incompatible. Please try converting your video using CloudConvert.com or similar tool to standard MP4 (H.264)." 
-          });
+          console.warn('⚠️ Video conversion failed, using original video:', conversionError.message);
+          // Don't fail - try with original video instead
+          // The Replicate model might handle it
         }
 
-        // Upload converted video to S3
-        const key = `tiktok-uploads/${crypto.randomUUID()}.mp4`; // Always .mp4 after conversion
+        // Upload video to S3 (converted or original)
+        const ext = conversionAttempted ? 'mp4' : (original.split(".").pop() || "mp4").toLowerCase();
+        const key = `tiktok-uploads/${crypto.randomUUID()}.${ext}`;
 
         await s3.send(new PutObjectCommand({
           Bucket: S3_BUCKET,
