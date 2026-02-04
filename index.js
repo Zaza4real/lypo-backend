@@ -136,16 +136,23 @@ async function convertVideoToStandardMP4(inputBuffer, originalFilename) {
     await fs.writeFile(inputPath, inputBuffer);
     
     // Convert to standard H.264 MP4
+    // iPhone videos often have extra streams (GPS, metadata) that cause errors
     await new Promise((resolve, reject) => {
       ffmpeg(inputPath)
         .videoCodec('libx264')           // H.264 codec (universally compatible)
         .audioCodec('aac')                // AAC audio (universally compatible)
+        .inputOptions([
+          '-ignore_unknown'               // Ignore unknown/problematic streams
+        ])
         .outputOptions([
+          '-map 0:v:0',                   // Map only first video stream
+          '-map 0:a:0?',                  // Map first audio stream (optional)
           '-preset fast',                 // Fast encoding
           '-crf 23',                      // Quality (lower = better, 23 is good)
           '-movflags +faststart',         // Optimize for streaming
           '-pix_fmt yuv420p',             // Color format (compatible)
-          '-vf scale=trunc(iw/2)*2:trunc(ih/2)*2' // Ensure even dimensions
+          '-vf scale=trunc(iw/2)*2:trunc(ih/2)*2', // Ensure even dimensions
+          '-max_muxing_queue_size 1024'   // Prevent muxing errors
         ])
         .output(outputPath)
         .on('start', (cmd) => {
