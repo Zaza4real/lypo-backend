@@ -1753,19 +1753,15 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
         // Using autocaption - adds karaoke-style captions to video (perfect for TikTok!)
         const tiktokReplicate = new Replicate({ auth: REPLICATE_API_TOKEN });
         
-        // RESTORED: Working parameters that preserve aspect ratio
-        console.log("🎬 Creating TikTok captions for:", videoUrl);
+        // ABSOLUTE MINIMUM: Only video URL, ZERO other parameters
+        // Testing if ANY parameter causes aspect ratio issues
+        console.log("🎬 Creating TikTok captions (zero config) for:", videoUrl);
         
         const prediction = await tiktokReplicate.predictions.create({
-          version: "18a45ff0d95feb4449d192bbdc06b4a6df168fa33def76dfc51b78ae224b599b", // fictions-ai/autocaption
+          version: "18a45ff0d95feb4449d192bbdc06b4a6df168fa33def76dfc51b78ae224b599b",
           input: {
-            video_file_input: videoUrl,
-            font_size: 6,               // Custom font size
-            subs_position: "bottom",    // Position at bottom
-            max_chars: 16,              // Max 16 characters per line
-            output_video_format: "mp4"  // Ensure mp4 output
-            // NO video_width, video_height, video_filters, video_quality
-            // Model auto-preserves aspect ratio and quality when these are omitted
+            video_file_input: videoUrl
+            // LITERALLY NOTHING ELSE - testing if model defaults preserve aspect ratio
           }
         });
         
