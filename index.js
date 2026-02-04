@@ -222,6 +222,20 @@ async function initDb() {
     );
   `);
 
+  // Jobs table for voiceover and other async tasks
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS jobs (
+      job_id TEXT PRIMARY KEY,
+      user_email TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'starting',
+      tool TEXT NOT NULL,
+      credits_used INTEGER NOT NULL DEFAULT 0,
+      output_url TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
 }
 
 function normEmail(email) {
