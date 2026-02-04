@@ -1696,6 +1696,13 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
 
     let fileInfo = null;
     let chunks = [];
+    let captionSettings = { size: 100, color: "#8B5CF6" }; // Defaults
+
+    bb.on("field", (name, value) => {
+      // Capture caption settings from form
+      if (name === "caption_size") captionSettings.size = parseInt(value, 10) || 30;
+      if (name === "highlight_color") captionSettings.color = value || "#8B5CF6";
+    });
 
     bb.on("file", (name, file, info) => {
       if (name !== "video") {
@@ -1756,15 +1763,17 @@ app.post("/api/tiktok-captions", auth, (req, res) => {
         // SWITCHED TO NEW MODEL: shreejalmaharjan-27/tiktok-short-captions
         // This model uses Whisper and is more reliable than fictions-ai/autocaption
         console.log("🎬 Creating TikTok captions with new model:", videoUrl);
+        console.log(`📏 Caption size: ${captionSettings.size}`);
+        console.log(`🎨 Highlight color: ${captionSettings.color}`);
         
         const prediction = await tiktokReplicate.predictions.create({
           version: "46bf1c12c77ad1782d6f87828d4d8ba4d48646b8e1271b490cb9e95ccdbc4504",
           input: {
-            video: videoUrl,              // Note: parameter name is "video", not "video_file_input"
-            caption_size: 30,             // Max words per caption window
-            highlight_color: "#8B5CF6",   // Purple highlight (LYPO brand color)
-            model: "large-v3",            // Whisper model size
-            language: "auto"              // Auto-detect language
+            video: videoUrl,                          // Video URL
+            caption_size: captionSettings.size,       // User-selected caption size
+            highlight_color: captionSettings.color,   // User-selected highlight color
+            model: "large-v3",                        // Whisper model size
+            language: "auto"                          // Auto-detect language
           }
         });
         
