@@ -45,11 +45,19 @@ function asyncHandler(fn){
 /* ---------------------------
    Support notification email (Resend)
    Env:
-     RESEND_API_KEY   = your Resend API key
-     SUPPORT_EMAIL    = where to notify (e.g. support@lypo.org)
-     EMAIL_FROM       = verified sender (e.g. Lypo <no-reply@lypo.org>)
+     RESEND_API_KEY         = your Resend API key
+     SUPPORT_EMAIL          = where to notify (e.g. support@lypo.org)
+     EMAIL_FROM             = verified sender (e.g. Lypo <no-reply@lypo.org>)
+     SEND_SIGNUP_EMAILS     = "true" to enable, "false" to disable (default: false)
 ---------------------------- */
 async function sendSupportNewUserEmail({ email, ip, ua }) {
+  // Check if signup emails are enabled
+  const emailsEnabled = process.env.SEND_SIGNUP_EMAILS === "true";
+  if (!emailsEnabled) {
+    console.log("ℹ️ Signup emails disabled (SEND_SIGNUP_EMAILS != 'true')");
+    return;
+  }
+
   const apiKey = process.env.RESEND_API_KEY || "";
   const to = process.env.SUPPORT_EMAIL || "";
   const from = process.env.EMAIL_FROM || "Lypo <no-reply@lypo.org>";
@@ -874,7 +882,7 @@ app.post("/api/auth/signup", authRateLimit, asyncHandler(async (req, res) => {
   const passwordHash = await bcrypt.hash(String(password), 10);
   const row = await createUser(e, passwordHash);
   
-  // Notify support (non-blocking)
+  // Notify support (non-blocking, controlled by SEND_SIGNUP_EMAILS env var)
   Promise.resolve(sendSupportNewUserEmail({ email: e, ip: (req.headers["x-forwarded-for"]||req.ip||"").toString().split(",")[0].trim(), ua: req.headers["user-agent"]||"" })).catch((err) => console.error("Support email failed:", err));
 
   res.json({ token: signToken(e), user: publicUserRow(row) });
@@ -927,7 +935,7 @@ app.post("/api/auth/google", authRateLimit, asyncHandler(async (req, res) => {
       
       user = await createUser(email, passwordHash);
       
-      // Notify support (non-blocking)
+      // Notify support (non-blocking, controlled by SEND_SIGNUP_EMAILS env var)
       Promise.resolve(sendSupportNewUserEmail({ 
         email, 
         ip: (req.headers["x-forwarded-for"]||req.ip||"").toString().split(",")[0].trim(), 
