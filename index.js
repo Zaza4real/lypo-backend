@@ -1528,6 +1528,7 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
     
     const { 
       text, 
+      voice = "bella",
       referenceAudio = null, 
       speed = 1.0,
       topP = 0.9,
@@ -1544,9 +1545,9 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
     const cost = Math.ceil((charCount / 1000) * 50);
     
     console.log(`🎙️ Chatterbox-Turbo voiceover request from ${userEmail}: ${charCount} chars = ${cost} credits`);
-    console.log(`   Speed: ${speed}x, Top P: ${topP}, Temperature: ${temperature}`);
+    console.log(`   Voice: ${voice}, Speed: ${speed}x, Top P: ${topP}, Temperature: ${temperature}`);
     if (referenceAudio) {
-      console.log(`   📎 Reference audio provided: ${referenceAudio.substring(0, 50)}...`);
+      console.log(`   📎 Reference audio provided (overrides voice selection): ${referenceAudio.substring(0, 50)}...`);
     }
     
     // Check user balance
@@ -1587,10 +1588,10 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
     // Start Chatterbox-Turbo TTS prediction (fastest open-source TTS)
     console.log(`🚀 Starting Chatterbox-Turbo TTS prediction...`);
     console.log(`   Text length: ${text.trim().length} chars`);
+    console.log(`   Voice: ${referenceAudio ? 'Reference Audio (cloned)' : voice}`);
     console.log(`   Speed: ${speed}x`);
     console.log(`   Top P: ${topP}`);
     console.log(`   Temperature: ${temperature}`);
-    console.log(`   Reference audio: ${referenceAudio ? 'Yes' : 'No'}`);
     
     // Build input object
     const input = {
@@ -1600,9 +1601,12 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
       temperature: temperature, // Randomness (0.1 to 1.5)
     };
     
-    // Add reference audio if provided (for voice cloning)
+    // Add reference audio if provided (for voice cloning) - takes priority over voice selection
     if (referenceAudio) {
       input.reference_audio = referenceAudio;
+    } else {
+      // Use selected voice if no reference audio
+      input.voice = voice;
     }
     
     const prediction = await replicate.predictions.create({
