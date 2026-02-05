@@ -1514,16 +1514,19 @@ app.get("/api/dub/:id", auth, asyncHandler(async (req, res) => {
 }));
 
 /* ---------------------------
-   VOICEOVER TOOL (ElevenLabs V3)
+   VOICEOVER TOOL (Chatterbox-Turbo by Resemble AI)
    POST /api/voiceover/generate
    GET  /api/voiceover/status/:jobId
+   
+   Model: resemble-ai/chatterbox-turbo
+   Features: Fast TTS, reference audio cloning, paralinguistic tags
 ---------------------------- */
 
 app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
   try {
     requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
     
-    const { text, voice = "af_bella", style = 0.5, speed = 1.0 } = req.body;
+    const { text, referenceAudio = null, speed = 1.0 } = req.body;
     const userEmail = req.user.email;
     
     if (!text || text.trim().length === 0) {
@@ -1534,7 +1537,10 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
     const charCount = text.trim().length;
     const cost = Math.ceil((charCount / 1000) * 50);
     
-    console.log(`🎙️ Voiceover request from ${userEmail}: ${charCount} chars = ${cost} credits`);
+    console.log(`🎙️ Chatterbox-Turbo voiceover request from ${userEmail}: ${charCount} chars = ${cost} credits`);
+    if (referenceAudio) {
+      console.log(`   📎 Reference audio provided: ${referenceAudio.substring(0, 50)}...`);
+    }
     
     // Check user balance
     const balanceQuery = await pool.query(
@@ -1571,23 +1577,30 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
       auth: REPLICATE_API_TOKEN,
     });
     
-    // Start Kokoro-82M TTS prediction (proven working model with 77M+ runs)
-    console.log(`🚀 Starting Kokoro-82M TTS prediction...`);
+    // Start Chatterbox-Turbo TTS prediction (fastest open-source TTS)
+    console.log(`🚀 Starting Chatterbox-Turbo TTS prediction...`);
     console.log(`   Text length: ${text.trim().length} chars`);
-    console.log(`   Voice: ${voice}`);
     console.log(`   Speed: ${speed}`);
+    console.log(`   Reference audio: ${referenceAudio ? 'Yes' : 'No'}`);
+    
+    // Build input object
+    const input = {
+      text: text.trim(),
+      speed: speed, // Speed control
+    };
+    
+    // Add reference audio if provided (for voice cloning)
+    if (referenceAudio) {
+      input.reference_audio = referenceAudio;
+    }
     
     const prediction = await replicate.predictions.create({
-      version: "d54f71bdf7c92de56fbfb4d03119af18efef37d3a0fd34e12275b007d485e480", // Kokoro-82M
-      input: {
-        text: text.trim(),
-        voice: voice, // Already in correct format (e.g., af_bella)
-        speed: speed, // 0.1 to 5.0
-      },
+      model: "resemble-ai/chatterbox-turbo", // Latest Chatterbox-Turbo model
+      input: input,
     });
     
     const jobId = prediction.id;
-    console.log(`✅ Kokoro-82M prediction created: ${jobId}`);
+    console.log(`✅ Chatterbox-Turbo prediction created: ${jobId}`);
     console.log(`   Initial status: ${prediction.status}`);
     
     // Store job info in database
