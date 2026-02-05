@@ -1609,10 +1609,14 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
       input.voice = voice;
     }
     
-    const prediction = await replicate.predictions.create({
-      model: "resemble-ai/chatterbox-turbo", // Latest Chatterbox-Turbo model
-      input: input,
-    });
+    // Use the model.predictions.create method which handles latest version automatically
+    const prediction = await replicate.models.predictions.create(
+      "resemble-ai", // owner
+      "chatterbox-turbo", // model name
+      {
+        input: input,
+      }
+    );
     
     const jobId = prediction.id;
     console.log(`✅ Chatterbox-Turbo prediction created: ${jobId}`);
