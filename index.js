@@ -1609,14 +1609,37 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
       input.voice = voice;
     }
     
-    // Get the latest model version and create prediction
-    const model = await replicate.models.get("resemble-ai", "chatterbox-turbo");
-    const prediction = await replicate.predictions.create({
-      version: model.latest_version.id,
-      input: input,
-    });
+    // Create prediction using the model identifier (Replicate will use latest version)
+    // Using the full model path format
+    const modelIdentifier = "resemble-ai/chatterbox-turbo";
     
-    const jobId = prediction.id;
+    try {
+      // Try to get model info to find latest version
+      const modelInfo = await fetch(`https://api.replicate.com/v1/models/${modelIdentifier}`, {
+        headers: {
+          'Authorization': `Token ${REPLICATE_API_TOKEN}`,
+        },
+      }).then(r => r.json());
+      
+      const latestVersion = modelInfo.latest_version?.id;
+      
+      if (!latestVersion) {
+        throw new Error("Could not get latest model version");
+      }
+      
+      console.log(`📦 Using Chatterbox-Turbo version: ${latestVersion}`);
+      
+      const prediction = await replicate.predictions.create({
+        version: latestVersion,
+        input: input,
+      });
+      
+      var jobId = prediction.id;
+    } catch (versionError) {
+      console.error("❌ Error getting model version:", versionError);
+      throw new Error("Failed to initialize Chatterbox-Turbo model");
+    }
+    
     console.log(`✅ Chatterbox-Turbo prediction created: ${jobId}`);
     console.log(`   Initial status: ${prediction.status}`);
     
