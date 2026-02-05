@@ -1528,11 +1528,10 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
     
     const { 
       text, 
-      voice = "bella",
-      referenceAudio = null, 
-      speed = 1.0,
-      topP = 0.9,
-      temperature = 0.7
+      voice = "Luna",
+      exaggeration = 0.5,
+      temperature = 0.5, // Maps to cfg parameter
+      pitch = 0
     } = req.body;
     const userEmail = req.user.email;
     
@@ -1544,11 +1543,8 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
     const charCount = text.trim().length;
     const cost = Math.ceil((charCount / 1000) * 50);
     
-    console.log(`🎙️ Chatterbox-Turbo voiceover request from ${userEmail}: ${charCount} chars = ${cost} credits`);
-    console.log(`   Voice: ${voice}, Speed: ${speed}x, Top P: ${topP}, Temperature: ${temperature}`);
-    if (referenceAudio) {
-      console.log(`   📎 Reference audio provided (overrides voice selection): ${referenceAudio.substring(0, 50)}...`);
-    }
+    console.log(`🎙️ Chatterbox-Pro voiceover request from ${userEmail}: ${charCount} chars = ${cost} credits`);
+    console.log(`   Voice: ${voice}, Exaggeration: ${exaggeration}, Temperature (cfg): ${temperature}, Pitch: ${pitch}`);
     
     // Check user balance
     const balanceQuery = await pool.query(
@@ -1585,33 +1581,28 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
       auth: REPLICATE_API_TOKEN,
     });
     
-    // Start Chatterbox-Turbo TTS prediction (fastest open-source TTS)
-    console.log(`🚀 Starting Chatterbox-Turbo TTS prediction...`);
+    // Start Chatterbox-Pro TTS prediction
+    console.log(`🚀 Starting Chatterbox-Pro TTS prediction...`);
     console.log(`   Text length: ${text.trim().length} chars`);
-    console.log(`   Voice: ${referenceAudio ? 'Reference Audio (cloned)' : voice}`);
-    console.log(`   Speed: ${speed}x`);
-    console.log(`   Top P: ${topP}`);
-    console.log(`   Temperature: ${temperature}`);
-    
-    // Using Chatterbox-Pro (production-grade, stable model)
-    console.log(`🚀 Using Chatterbox-Pro by Resemble AI`);
+    console.log(`   Voice: ${voice}`);
+    console.log(`   Exaggeration: ${exaggeration}`);
+    console.log(`   Temperature (cfg): ${temperature}`);
+    console.log(`   Pitch: ${pitch}`);
     
     // Build input for Chatterbox-Pro
     // NOTE: Chatterbox-Pro uses 'prompt' not 'text'
     const chatterboxInput = {
       prompt: text.trim(), // Chatterbox-Pro requires 'prompt' field
       voice: voice || "Luna", // Default to Luna if no voice selected
-      speed: speed,
+      exaggeration: exaggeration,
+      cfg: temperature, // Temperature maps to cfg (classifier-free guidance)
+      pitch: pitch,
     };
     
-    // Add reference audio if provided (voice cloning)
-    if (referenceAudio) {
-      chatterboxInput.audio_prompt = referenceAudio;
-      console.log(`   📎 Using reference audio for voice cloning`);
-    }
-    
     console.log(`   🎤 Voice: ${chatterboxInput.voice}`);
-    console.log(`   ⚡ Speed: ${speed}x`);
+    console.log(`   🎭 Exaggeration: ${exaggeration}`);
+    console.log(`   🎚️ CFG (Temperature): ${temperature}`);
+    console.log(`   🎵 Pitch: ${pitch}`);
     
     const prediction = await replicate.predictions.create({
       version: "301e12652e84fbba1524e5f2758a9a92c6bd205792304f53c057b7f9ab091342", // Chatterbox-Pro latest
@@ -1620,7 +1611,7 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
     
     const jobId = prediction.id;
     
-    console.log(`✅ Chatterbox-Turbo prediction created: ${jobId}`);
+    console.log(`✅ Chatterbox-Pro prediction created: ${jobId}`);
     console.log(`   Initial status: ${prediction.status}`);
     
     // Store job info in database
