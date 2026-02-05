@@ -1597,21 +1597,21 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
     console.log(`🚀 Using Chatterbox-Pro by Resemble AI`);
     
     // Build input for Chatterbox-Pro
+    // NOTE: Chatterbox-Pro uses 'prompt' not 'text'
     const chatterboxInput = {
-      text: text.trim(),
+      prompt: text.trim(), // Chatterbox-Pro requires 'prompt' field
+      voice: voice || "Luna", // Default to Luna if no voice selected
       speed: speed,
-      top_p: topP,
-      temperature: temperature,
     };
     
     // Add reference audio if provided (voice cloning)
     if (referenceAudio) {
-      chatterboxInput.audio_prompt = referenceAudio; // Chatterbox uses 'audio_prompt' for reference
+      chatterboxInput.audio_prompt = referenceAudio;
       console.log(`   📎 Using reference audio for voice cloning`);
-    } else if (voice) {
-      chatterboxInput.voice = voice;
-      console.log(`   🎤 Using voice: ${voice}`);
     }
+    
+    console.log(`   🎤 Voice: ${chatterboxInput.voice}`);
+    console.log(`   ⚡ Speed: ${speed}x`);
     
     const prediction = await replicate.predictions.create({
       version: "301e12652e84fbba1524e5f2758a9a92c6bd205792304f53c057b7f9ab091342", // Chatterbox-Pro latest
