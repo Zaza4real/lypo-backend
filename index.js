@@ -1609,14 +1609,21 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
       input.voice = voice;
     }
     
-    // Use the model.predictions.create method which handles latest version automatically
-    const prediction = await replicate.models.predictions.create(
-      "resemble-ai", // owner
-      "chatterbox-turbo", // model name
+    // Use replicate.run() which automatically uses the latest model version
+    const output = await replicate.run(
+      "resemble-ai/chatterbox-turbo",
       {
         input: input,
       }
     );
+    
+    // For replicate.run(), we need to create a job ID and handle it differently
+    // Let's use predictions.create with a proper version instead
+    const model = await replicate.models.get("resemble-ai", "chatterbox-turbo");
+    const prediction = await replicate.predictions.create({
+      version: model.latest_version.id,
+      input: input,
+    });
     
     const jobId = prediction.id;
     console.log(`✅ Chatterbox-Turbo prediction created: ${jobId}`);
