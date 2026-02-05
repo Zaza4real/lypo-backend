@@ -1526,7 +1526,13 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
   try {
     requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
     
-    const { text, referenceAudio = null, speed = 1.0 } = req.body;
+    const { 
+      text, 
+      referenceAudio = null, 
+      speed = 1.0,
+      topP = 0.9,
+      temperature = 0.7
+    } = req.body;
     const userEmail = req.user.email;
     
     if (!text || text.trim().length === 0) {
@@ -1538,6 +1544,7 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
     const cost = Math.ceil((charCount / 1000) * 50);
     
     console.log(`🎙️ Chatterbox-Turbo voiceover request from ${userEmail}: ${charCount} chars = ${cost} credits`);
+    console.log(`   Speed: ${speed}x, Top P: ${topP}, Temperature: ${temperature}`);
     if (referenceAudio) {
       console.log(`   📎 Reference audio provided: ${referenceAudio.substring(0, 50)}...`);
     }
@@ -1580,13 +1587,17 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
     // Start Chatterbox-Turbo TTS prediction (fastest open-source TTS)
     console.log(`🚀 Starting Chatterbox-Turbo TTS prediction...`);
     console.log(`   Text length: ${text.trim().length} chars`);
-    console.log(`   Speed: ${speed}`);
+    console.log(`   Speed: ${speed}x`);
+    console.log(`   Top P: ${topP}`);
+    console.log(`   Temperature: ${temperature}`);
     console.log(`   Reference audio: ${referenceAudio ? 'Yes' : 'No'}`);
     
     // Build input object
     const input = {
       text: text.trim(),
-      speed: speed, // Speed control
+      speed: speed, // Speed control (0.5 to 1.5)
+      top_p: topP, // Top P sampling (0.1 to 1.0)
+      temperature: temperature, // Randomness (0.1 to 1.5)
     };
     
     // Add reference audio if provided (for voice cloning)
