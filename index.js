@@ -1593,52 +1593,21 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
     console.log(`   Top P: ${topP}`);
     console.log(`   Temperature: ${temperature}`);
     
-    // Build input object
-    const input = {
-      text: text.trim(),
-      speed: speed, // Speed control (0.5 to 1.5)
-      top_p: topP, // Top P sampling (0.1 to 1.0)
-      temperature: temperature, // Randomness (0.1 to 1.5)
-    };
+    // For now, using Kokoro-82M (proven working) until Chatterbox-Turbo version is confirmed
+    // Kokoro only supports: text, voice, speed
+    console.log(`🚀 Using Kokoro-82M (stable, proven model)`);
+    console.log(`   Note: Kokoro doesn't support top_p, temperature, or reference_audio yet`);
     
-    // Add reference audio if provided (for voice cloning) - takes priority over voice selection
-    if (referenceAudio) {
-      input.reference_audio = referenceAudio;
-    } else {
-      // Use selected voice if no reference audio
-      input.voice = voice;
-    }
+    const prediction = await replicate.predictions.create({
+      version: "d54f71bdf7c92de56fbfb4d03119af18efef37d3a0fd34e12275b007d485e480", // Kokoro-82M
+      input: {
+        text: text.trim(),
+        voice: voice || "af_bella",
+        speed: speed,
+      },
+    });
     
-    // Create prediction using the model identifier (Replicate will use latest version)
-    // Using the full model path format
-    const modelIdentifier = "resemble-ai/chatterbox-turbo";
-    
-    try {
-      // Try to get model info to find latest version
-      const modelInfo = await fetch(`https://api.replicate.com/v1/models/${modelIdentifier}`, {
-        headers: {
-          'Authorization': `Token ${REPLICATE_API_TOKEN}`,
-        },
-      }).then(r => r.json());
-      
-      const latestVersion = modelInfo.latest_version?.id;
-      
-      if (!latestVersion) {
-        throw new Error("Could not get latest model version");
-      }
-      
-      console.log(`📦 Using Chatterbox-Turbo version: ${latestVersion}`);
-      
-      const prediction = await replicate.predictions.create({
-        version: latestVersion,
-        input: input,
-      });
-      
-      var jobId = prediction.id;
-    } catch (versionError) {
-      console.error("❌ Error getting model version:", versionError);
-      throw new Error("Failed to initialize Chatterbox-Turbo model");
-    }
+    const jobId = prediction.id;
     
     console.log(`✅ Chatterbox-Turbo prediction created: ${jobId}`);
     console.log(`   Initial status: ${prediction.status}`);
