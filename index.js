@@ -1596,7 +1596,7 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
       voice: voice || "Luna", // Default to Luna if no voice selected
       exaggeration: exaggeration,
       cfg: temperature, // Temperature maps to cfg (classifier-free guidance)
-      pitch: pitch,
+      pitch: pitch.toString(), // API requires pitch as string
     };
     
     console.log(`   🎤 Voice: ${chatterboxInput.voice}`);
