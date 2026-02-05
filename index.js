@@ -1593,18 +1593,29 @@ app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
     console.log(`   Top P: ${topP}`);
     console.log(`   Temperature: ${temperature}`);
     
-    // For now, using Kokoro-82M (proven working) until Chatterbox-Turbo version is confirmed
-    // Kokoro only supports: text, voice, speed
-    console.log(`🚀 Using Kokoro-82M (stable, proven model)`);
-    console.log(`   Note: Kokoro doesn't support top_p, temperature, or reference_audio yet`);
+    // Using Chatterbox-Pro (production-grade, stable model)
+    console.log(`🚀 Using Chatterbox-Pro by Resemble AI`);
+    
+    // Build input for Chatterbox-Pro
+    const chatterboxInput = {
+      text: text.trim(),
+      speed: speed,
+      top_p: topP,
+      temperature: temperature,
+    };
+    
+    // Add reference audio if provided (voice cloning)
+    if (referenceAudio) {
+      chatterboxInput.audio_prompt = referenceAudio; // Chatterbox uses 'audio_prompt' for reference
+      console.log(`   📎 Using reference audio for voice cloning`);
+    } else if (voice) {
+      chatterboxInput.voice = voice;
+      console.log(`   🎤 Using voice: ${voice}`);
+    }
     
     const prediction = await replicate.predictions.create({
-      version: "d54f71bdf7c92de56fbfb4d03119af18efef37d3a0fd34e12275b007d485e480", // Kokoro-82M
-      input: {
-        text: text.trim(),
-        voice: voice || "af_bella",
-        speed: speed,
-      },
+      version: "301e12652e84fbba1524e5f2758a9a92c6bd205792304f53c057b7f9ab091342", // Chatterbox-Pro latest
+      input: chatterboxInput,
     });
     
     const jobId = prediction.id;
