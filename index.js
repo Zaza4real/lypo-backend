@@ -1,3 +1,36 @@
+
+async function recordPaymentFromSessionIfMissing(sessionId, email) {
+  try {
+    const existing = await pool.query(
+      "SELECT 1 FROM payments WHERE stripe_session_id=$1 LIMIT 1",
+      [sessionId]
+    );
+    if (existing.rows.length) return;
+
+    const session = await stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ["payment_intent", "line_items"]
+    });
+
+    if (session.payment_status !== "paid") return;
+
+    const amountUsd = (session.amount_total || 0) / 100;
+    const credits = Math.round(amountUsd * 100); // same logic you already use
+    const invoiceUrl = await resolveInvoiceUrlFromSession(session);
+
+    await pool.query(
+      `INSERT INTO payments (email, stripe_session_id, amount_usd, lypos, status, invoice_url)
+       VALUES ($1,$2,$3,$4,'paid',$5)`,
+      [email, sessionId, amountUsd, credits, invoiceUrl]
+    );
+
+    await pool.query(
+      "UPDATE users SET balance = balance + $1 WHERE email=$2",
+      [credits, email]
+    );
+  } catch (e) {
+    console.error("recordPaymentFromSessionIfMissing failed:", e.message);
+  }
+}
 import express from "express";
 import Replicate from "replicate";
 import Busboy from "busboy";
@@ -8,380 +41,57 @@ import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import pg from "pg";
 import { Resend } from "resend";
-import ffmpeg from "fluent-ffmpeg";
-import ffmpegPath from "@ffmpeg-installer/ffmpeg";
-import { promises as fs } from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
-import os from "os";
-import sharp from "sharp";
 
-// Setup FFmpeg path
-ffmpeg.setFfmpegPath(ffmpegPath.path);
-
-// Get __dirname in ES modules
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// Security and Performance imports (with fallbacks)
-let helmet, compression, rateLimit, xssClean;
-try {
-  helmet = (await import("helmet")).default;
-  compression = (await import("compression")).default;
-  rateLimit = (await import("express-rate-limit")).rateLimit;
-  xssClean = (await import("xss-clean")).default;
-} catch (err) {
-  console.warn("⚠️ Some security packages not installed. Run: npm install");
-}
-
-
-// async wrapper for express routes
-function asyncHandler(fn){
-  return (req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next);
-}
+// Resend email client (safe init)
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
 
 
-/* ---------------------------
-   Support notification email (Resend)
-   Env:
-     RESEND_API_KEY         = your Resend API key
-     SUPPORT_EMAIL          = where to notify (e.g. support@lypo.org)
-     EMAIL_FROM             = verified sender (e.g. Lypo <no-reply@lypo.org>)
-     SEND_SIGNUP_EMAILS     = "true" to enable, "false" to disable (default: false)
----------------------------- */
-async function sendSupportNewUserEmail({ email, ip, ua }) {
-  // Check if signup emails are enabled
-  const emailsEnabled = process.env.SEND_SIGNUP_EMAILS === "true";
-  if (!emailsEnabled) {
-    console.log("ℹ️ Signup emails disabled (SEND_SIGNUP_EMAILS != 'true')");
-    return;
-  }
+// asyncHandler helper (prevents unhandled promise rejections in routes)
+const asyncHandler = (fn) => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
 
-  const apiKey = process.env.RESEND_API_KEY || "";
-  const to = process.env.SUPPORT_EMAIL || "";
-  const from = process.env.EMAIL_FROM || "Lypo <no-reply@lypo.org>";
-
-  if (!apiKey || !to) {
-    console.warn("⚠️ Support email not sent (missing RESEND_API_KEY or SUPPORT_EMAIL)");
-    return;
-  }
-
-  const resend = new Resend(apiKey);
-  const subject = `🆕 New user signup: ${email}`;
-  const html = `
-    <div style="font-family:Arial,sans-serif;line-height:1.5">
-      <h2 style="margin:0 0 12px 0;">New user created</h2>
-      <p style="margin:0 0 8px 0;"><strong>Email:</strong> ${email}</p>
-      ${ip ? `<p style="margin:0 0 8px 0;"><strong>IP:</strong> ${ip}</p>` : ``}
-      ${ua ? `<p style="margin:0 0 8px 0;"><strong>User-Agent:</strong> ${ua}</p>` : ``}
-      <p style="margin:0;color:#666;">Timestamp (UTC): ${new Date().toISOString()}</p>
-    </div>
-  `;
-
-  try {
-    await resend.emails.send({ from, to, subject, html });
-  } catch (err) {
-    console.error("❌ Resend error:", err);
-  }
-}
-
-/* ---------------------------
-   Helper: Send credit purchase notification
----------------------------- */
-async function sendCreditPurchaseEmail(email, credits, amountUsd, invoiceUrl) {
-  const apiKey = process.env.RESEND_API_KEY;
-  if (!apiKey) {
-    console.warn("⚠️ RESEND_API_KEY not set, skipping email");
-    return;
-  }
-
-  const from = process.env.RESEND_FROM_EMAIL || "onboarding@resend.dev";
-  const to = process.env.RESEND_TO_EMAIL || "support@lypo.org";
-
-  if (!to) {
-    console.warn("⚠️ RESEND_TO_EMAIL not set, skipping");
-    return;
-  }
-
-  const resend = new Resend(apiKey);
-  const subject = `💰 Credit Purchase: ${email} bought ${credits} credits`;
-  const html = `
-    <div style="font-family:Arial,sans-serif;line-height:1.5">
-      <h2 style="margin:0 0 12px 0;color:#10b981;">💰 New Credit Purchase</h2>
-      <div style="background:#f0fdf4;border-left:4px solid #10b981;padding:16px;margin:16px 0;">
-        <p style="margin:0 0 8px 0;font-size:24px;font-weight:bold;color:#10b981;">${credits} Credits</p>
-        <p style="margin:0 0 8px 0;"><strong>Customer:</strong> ${email}</p>
-        <p style="margin:0 0 8px 0;"><strong>Amount Paid:</strong> $${amountUsd.toFixed(2)} USD</p>
-        <p style="margin:0 0 8px 0;"><strong>Rate:</strong> ${(credits / amountUsd).toFixed(0)} credits per $1</p>
-        ${invoiceUrl ? `<p style="margin:0 0 8px 0;"><strong>Receipt:</strong> <a href="${invoiceUrl}" style="color:#0066cc;">View Receipt</a></p>` : ''}
-      </div>
-      <p style="margin:0;color:#666;font-size:13px;">Timestamp (UTC): ${new Date().toISOString()}</p>
-    </div>
-  `;
-
-  try {
-    await resend.emails.send({ from, to, subject, html });
-    console.log("✅ Credit purchase email sent to:", to);
-  } catch (err) {
-    console.error("❌ Resend credit purchase email error:", err);
-  }
-}
-
-/* ---------------------------
-   Helper: Check if FFmpeg is available
----------------------------- */
-let ffmpegAvailable = null;
-async function checkFFmpegAvailable() {
-  if (ffmpegAvailable !== null) return ffmpegAvailable;
-  
-  try {
-    await new Promise((resolve, reject) => {
-      ffmpeg.getAvailableFormats((err, formats) => {
-        if (err) reject(err);
-        else resolve(formats);
-      });
-    });
-    ffmpegAvailable = true;
-    console.log('✅ FFmpeg is available');
-    return true;
-  } catch (error) {
-    ffmpegAvailable = false;
-    console.warn('⚠️ FFmpeg not available:', error.message);
-    return false;
-  }
-}
-
-/* ---------------------------
-   Helper: Convert HEIC/HEIF images to JPEG
-   This fixes iPhone images that use HEIC format
----------------------------- */
-async function convertHEICtoJPEG(imageBuffer, originalFilename) {
-  try {
-    console.log(`🖼️  Converting HEIC image to JPEG: ${originalFilename}`);
-    
-    // Use sharp to convert HEIC to JPEG
-    const jpegBuffer = await sharp(imageBuffer)
-      .jpeg({ quality: 90, mozjpeg: true }) // High quality JPEG
-      .toBuffer();
-    
-    console.log(`✅ HEIC conversion successful: ${originalFilename}`);
-    console.log(`   Original: ${(imageBuffer.length / 1024).toFixed(2)} KB`);
-    console.log(`   JPEG: ${(jpegBuffer.length / 1024).toFixed(2)} KB`);
-    
-    return jpegBuffer;
-  } catch (error) {
-    console.error('❌ HEIC conversion error:', error.message);
-    throw new Error(`Failed to convert HEIC image: ${error.message}`);
-  }
-}
-
-/* ---------------------------
-   Helper: Convert video to standard H.264 MP4
-   This fixes iPhone HEVC/H.265 videos and other problematic formats
----------------------------- */
-async function convertVideoToStandardMP4(inputBuffer, originalFilename) {
-  // Check if FFmpeg is available
-  const hasFFmpeg = await checkFFmpegAvailable();
-  if (!hasFFmpeg) {
-    console.warn('⚠️ FFmpeg not available, skipping conversion');
-    return inputBuffer; // Return original video without conversion
-  }
-  
-  const tempDir = os.tmpdir();
-  const inputPath = path.join(tempDir, `input-${crypto.randomUUID()}-${originalFilename}`);
-  const outputPath = path.join(tempDir, `output-${crypto.randomUUID()}.mp4`);
-  
-  console.log(`🔄 Converting video to H.264 MP4...`);
-  console.log(`   Input: ${originalFilename}`);
-  
-  try {
-    // Write input buffer to temp file
-    await fs.writeFile(inputPath, inputBuffer);
-    
-    // Convert to standard H.264 MP4 with LOW MEMORY USAGE
-    // Optimized for Render's 512MB free tier
-    await new Promise((resolve, reject) => {
-      const command = ffmpeg(inputPath)
-        .videoCodec('libx264')           // H.264 codec (universally compatible)
-        .audioCodec('aac')                // AAC audio (universally compatible)
-        .inputOptions([
-          '-ignore_unknown',              // Ignore unknown/problematic streams
-          '-analyzeduration 5000000',     // Reduce analysis time
-          '-probesize 5000000'            // Reduce probe size (saves memory)
-        ])
-        .outputOptions([
-          '-map 0:v:0',                   // Map only first video stream
-          '-map 0:a:0?',                  // Map first audio stream (optional)
-          '-preset ultrafast',            // Fastest encoding (less memory)
-          '-crf 28',                      // Lower quality (saves memory, still good)
-          '-movflags +faststart',         // Optimize for streaming
-          '-pix_fmt yuv420p',             // Color format (compatible)
-          '-vf scale=trunc(iw/2)*2:trunc(ih/2)*2', // Ensure even dimensions
-          '-max_muxing_queue_size 400',   // Lower buffer (less memory)
-          '-bufsize 1000k',               // Limit buffer size (saves memory)
-          '-threads 1',                   // Single thread (saves memory)
-          '-g 52'                         // Keyframe interval (saves memory)
-        ])
-        .output(outputPath);
-      
-      // Add timeout to prevent hanging (kills process after 90 seconds)
-      const timeout = setTimeout(() => {
-        command.kill('SIGKILL');
-        reject(new Error('Conversion timeout - video too large or server memory limited'));
-      }, 90000);
-      
-      command
-        .on('start', (cmd) => {
-          console.log(`   FFmpeg command: ${cmd}`);
-          console.log(`   Memory-optimized mode (ultrafast, CRF 28, 1 thread)`);
-        })
-        .on('progress', (progress) => {
-          if (progress.percent) {
-            console.log(`   Progress: ${Math.round(progress.percent)}%`);
-          }
-        })
-        .on('end', () => {
-          clearTimeout(timeout);
-          console.log('✅ Video conversion complete');
-          resolve();
-        })
-        .on('error', (err) => {
-          clearTimeout(timeout);
-          console.error('❌ FFmpeg conversion error:', err.message);
-          reject(new Error(`Video conversion failed: ${err.message}`));
-        })
-        .run();
-    });
-    
-    // Read converted video
-    const convertedBuffer = await fs.readFile(outputPath);
-    
-    // Cleanup temp files
-    try {
-      await fs.unlink(inputPath);
-      await fs.unlink(outputPath);
-    } catch (cleanupErr) {
-      console.warn('⚠️ Temp file cleanup warning:', cleanupErr.message);
-    }
-    
-    console.log(`✅ Converted video size: ${(convertedBuffer.length / 1024 / 1024).toFixed(2)} MB`);
-    return convertedBuffer;
-    
-  } catch (error) {
-    // Cleanup on error
-    try {
-      await fs.unlink(inputPath).catch(() => {});
-      await fs.unlink(outputPath).catch(() => {});
-    } catch (cleanupErr) {
-      // Ignore cleanup errors
-    }
-    throw error;
-  }
-}
 
 const app = express();
-app.set("trust proxy", 1);
 
-/* ---------------------------
-   SECURITY & PERFORMANCE MIDDLEWARE
----------------------------- */
+function requireAdmin(req, res, next) {
+  // Allow admin via env whitelist OR token flag OR DB flag
+  const email = req.user?.email;
+  const tokenAdmin = req.user?.is_admin === true;
+  const envAdmin = isAdminEmail(email);
+  if (envAdmin || tokenAdmin) return next();
 
-// Security Headers (Helmet) - TEMPORARILY DISABLED FOR DEBUGGING
-// TODO: Re-enable after testing
-/*
-if (helmet) {
-  app.use(helmet({
-    contentSecurityPolicy: false, // Disabled temporarily
-    hsts: {
-      maxAge: 31536000,
-      includeSubDomains: true,
-      preload: true
-    },
-    frameguard: { action: 'deny' },
-    referrerPolicy: { policy: 'strict-origin-when-cross-origin' }
-  }));
-} else {
-*/
-  // Minimal security headers only
-  app.use((req, res, next) => {
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('X-Frame-Options', 'DENY');
-    next();
-  });
-// }
-
-// Compression (gzip/deflate)
-if (compression) {
-  app.use(compression({
-    filter: (req, res) => {
-      if (req.headers['x-no-compression']) return false;
-      return compression.filter(req, res);
-    },
-    level: 6 // Good balance between speed and compression
-  }));
+  // Fallback: check DB (helps old tokens)
+  if (!email) return res.status(403).json({ error: "Admin access required" });
+  getUserByEmail(email).then((u) => {
+    if (u?.is_admin) return next();
+    return res.status(403).json({ error: "Admin access required" });
+  }).catch(() => res.status(403).json({ error: "Admin access required" }));
 }
 
-// XSS Protection - TEMPORARILY DISABLED FOR DEBUGGING
-// if (xssClean) {
-//   app.use(xssClean());
-// }
-
-// Rate Limiting - TEMPORARILY DISABLED FOR DEBUGGING
-// Will re-enable after confirming tools work
-/*
-if (rateLimit) {
-  const apiLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 100,
-    message: 'Too many requests from this IP, please try again later.',
-    standardHeaders: true,
-    legacyHeaders: false,
-  });
-  app.use('/api/', apiLimiter);
-}
-*/
 
 /* ---------------------------
    CORS
 ---------------------------- */
 const allowedOrigins = new Set([
-  "https://lypo.org",
-  "https://www.lypo.org",
   "https://digitalgeekworld.com",
   "https://www.digitalgeekworld.com",
   "https://homepage-3d78.onrender.com",
-  "http://localhost:3000",
-  "http://localhost:5173",
-  "http://127.0.0.1:3000",
-  "http://127.0.0.1:5173",
+  "https://lypo.org",
+  "https://www.lypo.org",
   process.env.FRONTEND_URL || ""
 ].filter(Boolean));
-
 const CORS_ALLOW_ALL = process.env.CORS_ALLOW_ALL === "1";
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  
-  // Set CORS headers for allowed origins
   if (origin && (CORS_ALLOW_ALL || allowedOrigins.has(origin))) {
     res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Access-Control-Allow-Credentials", "true");
-  } else if (!origin) {
-    // If no origin header (same-origin request), allow it
-    res.setHeader("Access-Control-Allow-Origin", "*");
   }
-  
   res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH");
-  res.setHeader("Access-Control-Max-Age", "86400"); // 24 hours
-  
-  // Handle preflight
-  if (req.method === "OPTIONS") {
-    return res.status(204).end();
-  }
-  
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
@@ -398,6 +108,119 @@ const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
 const JWT_SECRET = process.env.JWT_SECRET || "dev_change_me";
 
+// ---- Resend (Support emails)
+if (process.env.RESEND_API_KEY) {
+  try {
+    resend = new Resend(process.env.RESEND_API_KEY);
+  } catch (e) {
+    console.error("Resend init failed:", e?.message || e);
+  }
+}
+const EMAIL_FROM = process.env.EMAIL_FROM || "LYPO <no-reply@lypo.org>";
+const SUPPORT_TO = process.env.SUPPORT_TO || process.env.SUPPORT_EMAIL || process.env.ADMIN_EMAIL || "";
+
+
+
+
+
+async function sendNewUserNotification(email) {
+  const apiKey = (process.env.RESEND_API_KEY || "").trim();
+  const supportTo = (process.env.SUPPORT_EMAIL || process.env.RESEND_FROM || "").trim();
+  if (!apiKey || !supportTo || !resend) {
+    console.log("👤 New user registered:", email);
+    return;
+  }
+
+  try {
+    await resend.emails.send({
+      from: process.env.RESEND_FROM || supportTo,
+      to: supportTo,
+      subject: "New LYPO user registered",
+      html: `
+        <div style="font-family:Arial,Helvetica,sans-serif">
+          <h3>New user signup</h3>
+          <p><b>Email:</b> ${email}</p>
+          <p><b>Time:</b> ${new Date().toLocaleString()}</p>
+        </div>
+      `
+    });
+    console.log("📩 Support notified about new user:", email);
+  } catch (e) {
+    console.log("Support notify failed:", e?.message || e);
+  }
+}
+
+async function sendEmailVerification({ email, token }) {
+  const apiKey = (process.env.RESEND_API_KEY || "").trim();
+  const from = (process.env.RESEND_FROM || "support@lypo.org").trim();
+  if (!apiKey) {
+    console.log("🔑 Email verify link (Resend not configured):", `${FRONTEND_URL}/auth.html#verify=${token}&email=${encodeURIComponent(email)}`);
+    return;
+  }
+
+  const verifyUrl = `${FRONTEND_URL}/auth.html#verify=${token}&email=${encodeURIComponent(email)}`;
+
+  await resend.emails.send({
+    from,
+    to: email,
+    subject: "Welcome to LYPO — confirm your email",
+    html: `
+      <div style="font-family: Arial, Helvetica, sans-serif; line-height: 1.5; color: #111;">
+        <h2 style="margin:0 0 8px 0;">Welcome to LYPO 👋</h2>
+        <p style="margin:0 0 14px 0;">Please confirm your email to activate your account.</p>
+        <p style="margin:0 0 18px 0;">
+          <a href="${verifyUrl}" style="display:inline-block; padding:10px 14px; background:#111; color:#fff; text-decoration:none; border-radius:10px;">
+            Confirm email
+          </a>
+        </p>
+        <p style="margin:0; font-size:12px; color:#444;">If the button doesn't work, open this link:</p>
+        <p style="margin:6px 0 0 0; font-size:12px; color:#444;">${verifyUrl}</p>
+      </div>
+    `,
+  });
+
+  console.log("📩 Verification email sent to:", email);
+}
+
+async function sendSupportEmail({ fromEmail, subject, message, authedEmail }) {
+  const to = SUPPORT_TO;
+  const safeSubject = (subject && String(subject).trim()) ? String(subject).trim() : "New support request";
+  const body = String(message || "").trim();
+  const fromLine = fromEmail ? String(fromEmail).trim() : "(not provided)";
+  const authedLine = authedEmail ? String(authedEmail).trim() : "";
+  const html = `
+    <p><strong>Support request</strong></p>
+    <p><strong>From:</strong> ${fromLine}${authedLine ? ` (logged in as ${authedLine})` : ""}</p>
+    <p><strong>Subject:</strong> ${safeSubject}</p>
+    <p><strong>Message:</strong></p>
+    <pre style="white-space:pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;">${body.replace(/</g,"&lt;").replace(/>/g,"&gt;")}</pre>
+  `;
+
+  if (!to) {
+    console.log("⚠️ SUPPORT_TO not configured. Support message:", { fromEmail, safeSubject, body });
+    return { ok: false, reason: "SUPPORT_TO_NOT_SET" };
+  }
+
+  if (!resend) {
+    console.log("⚠️ RESEND_API_KEY not configured. Support message:", { to, fromEmail, safeSubject, body });
+    return { ok: false, reason: "RESEND_NOT_CONFIGURED" };
+  }
+
+  const { data, error } = await resend.emails.send({
+    from: EMAIL_FROM,
+    to: [to],
+    replyTo: fromEmail || undefined,
+    subject: `[LYPO Support] ${safeSubject}`,
+    html
+  });
+
+  if (error) {
+    console.error("❌ Resend support email error:", error);
+    return { ok: false, reason: "SEND_FAILED", error };
+  }
+  return { ok: true, id: data?.id || null };
+}
+
 // ---- Postgres
 const { Pool } = pg;
 const pool = new Pool({
@@ -406,17 +229,49 @@ const pool = new Pool({
   ssl: process.env.DISABLE_PG_SSL === "1" ? false : { rejectUnauthorized: false }
 });
 
+async function ensureBlogTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS blog_posts (
+      id SERIAL PRIMARY KEY,
+      slug TEXT UNIQUE NOT NULL,
+      title TEXT NOT NULL,
+      excerpt TEXT,
+      content_html TEXT NOT NULL,
+      cover_url TEXT,
+      video_url TEXT,
+      status TEXT NOT NULL DEFAULT 'draft',
+      published_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      author_email TEXT
+    );
+  `);
+}
+
+
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       email TEXT PRIMARY KEY,
       password_hash TEXT NOT NULL,
       balance INTEGER NOT NULL DEFAULT 0,
+      is_admin BOOLEAN NOT NULL DEFAULT FALSE,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS payments (
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;
+  `);
+  await pool.query(`
+    
+CREATE TABLE IF NOT EXISTS email_verifications (
+  token TEXT PRIMARY KEY,
+  email TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  used_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS payments (
       id BIGSERIAL PRIMARY KEY,
       email TEXT NOT NULL,
       stripe_session_id TEXT UNIQUE,
@@ -437,7 +292,6 @@ async function initDb() {
       output_url TEXT,
       cost_credits INTEGER NOT NULL DEFAULT 0,
       refunded BOOLEAN NOT NULL DEFAULT false,
-      type TEXT NOT NULL DEFAULT 'video_translation',
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
@@ -446,94 +300,118 @@ async function initDb() {
   // Migrations for existing databases
   await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS cost_credits INTEGER NOT NULL DEFAULT 0;`);
   await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS refunded BOOLEAN NOT NULL DEFAULT false;`);
-  await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'video_translation';`);
   await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS invoice_url TEXT;`);
-
-  // Blog posts
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS blog_posts (
-      id SERIAL PRIMARY KEY,
-      title TEXT NOT NULL,
-      slug TEXT NOT NULL UNIQUE,
-      excerpt TEXT DEFAULT '',
-      cover_url TEXT DEFAULT '',
-      video_url TEXT DEFAULT '',
-      content_html TEXT NOT NULL DEFAULT '',
-      status TEXT NOT NULL DEFAULT 'draft',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-
-  // Jobs table for voiceover and other async tasks
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS jobs (
-      job_id TEXT PRIMARY KEY,
-      user_email TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'starting',
-      tool TEXT NOT NULL,
-      credits_used INTEGER NOT NULL DEFAULT 0,
-      output_url TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-  `);
-
 }
 
 function normEmail(email) {
   return String(email || "").toLowerCase().trim();
 }
 function publicUserRow(r) {
-  return { email: r.email, balance: Number(r.balance || 0), createdAt: r.created_at };
+  return { email: r.email, balance: Number(r.balance || 0), isAdmin: !!r.is_admin, createdAt: r.created_at };
 }
-function signToken(email) {
-  return jwt.sign({ email }, JWT_SECRET, { expiresIn: "30d" });
+function signToken(email, is_admin) {
+  const payload = { email: String(email || "").toLowerCase() };
+  if (typeof is_admin !== "undefined") payload.is_admin = !!is_admin;
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: "30d" });
 }
 
 async function getUserByEmail(email) {
   const e = normEmail(email);
   const { rows } = await pool.query(
-    "SELECT email, password_hash, balance, created_at FROM users WHERE email=$1",
+    "SELECT email, password_hash, balance, is_admin, created_at FROM users WHERE email=$1",
     [e]
   );
   return rows[0] || null;
 }
-
 async function createUser(email, passwordHash) {
   const e = normEmail(email);
   const { rows } = await pool.query(
-    "INSERT INTO users (email, password_hash, balance) VALUES ($1,$2,50) RETURNING email, password_hash, balance, created_at",
+    "INSERT INTO users (email, password_hash, balance, is_admin) VALUES ($1,$2,0,FALSE) RETURNING email, password_hash, balance, is_admin, created_at",
     [e, passwordHash]
   );
   return rows[0];
 }
 
-async function recordPayment({ email, stripeSessionId, amountUsd, lypos, status, invoiceUrl }) {
-  const e = normEmail(email);
-  await pool.query(
-    `INSERT INTO payments (email, stripe_session_id, amount_usd, lypos, status, invoice_url)
-     VALUES ($1,$2,$3,$4,$5,$6)
-     ON CONFLICT (stripe_session_id) DO UPDATE SET
-       status=EXCLUDED.status,
-       invoice_url=COALESCE(EXCLUDED.invoice_url, payments.invoice_url)`,
-    [e, stripeSessionId || null, Number(amountUsd||0), Math.trunc(lypos||0), status || "completed", invoiceUrl || null]
-  );
+
+async function resolveInvoiceUrlFromSession(session) {
+  let invoiceUrl = null;
+  try {
+    // For one-time payments, Stripe may not create an invoice.
+    if (session?.invoice) {
+      const inv = await stripe.invoices.retrieve(String(session.invoice));
+      invoiceUrl = inv.invoice_pdf || inv.hosted_invoice_url || null;
+    } else if (session?.payment_intent) {
+      const piId = typeof session.payment_intent === "string" ? session.payment_intent : session.payment_intent.id;
+      const pi = await stripe.paymentIntents.retrieve(String(piId), { expand: ["charges"] });
+      const charge = pi?.charges?.data?.[0];
+      invoiceUrl = charge?.receipt_url || null;
+    }
+  } catch {
+    invoiceUrl = null;
+  }
+  return invoiceUrl;
 }
 
-async function upsertVideo({ email, predictionId, status, inputUrl, outputUrl, costCredits, type }) {
+async function resolveInvoiceUrlBySessionId(sessionId) {
+  try {
+    const session = await stripe.checkout.sessions.retrieve(String(sessionId), { expand: ["payment_intent"] });
+    return await resolveInvoiceUrlFromSession(session);
+  } catch {
+    return null;
+  }
+}
+
+async function recordPayment({ email, stripeSessionId, amountUsd, lypos, status, invoiceUrl }) {
+  const e = normEmail(email);
+  const sid = stripeSessionId || null;
+  if (!sid) throw new Error("Missing stripeSessionId");
+
+  // Idempotent write without requiring a UNIQUE constraint (Render DB schema may differ).
+  // Strategy: try UPDATE first; if nothing updated, INSERT if not exists.
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const upd = await client.query(
+      `UPDATE payments
+         SET status=$1,
+             invoice_url=COALESCE($2, invoice_url),
+             amount_usd=COALESCE(NULLIF($3,0), amount_usd),
+             lypos=COALESCE(NULLIF($4,0), lypos)
+       WHERE stripe_session_id=$5 AND email=$6`,
+      [status || "completed", invoiceUrl || null, Number(amountUsd || 0), Math.trunc(lypos || 0), sid, e]
+    );
+
+    if (upd.rowCount === 0) {
+      await client.query(
+        `INSERT INTO payments (email, stripe_session_id, amount_usd, lypos, status, invoice_url)
+         SELECT $1,$2,$3,$4,$5,$6
+         WHERE NOT EXISTS (SELECT 1 FROM payments WHERE stripe_session_id=$2 AND email=$1)`,
+        [e, sid, Number(amountUsd || 0), Math.trunc(lypos || 0), status || "completed", invoiceUrl || null]
+      );
+    }
+
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+
+async function upsertVideo({ email, predictionId, status, inputUrl, outputUrl }) {
   const e = normEmail(email);
   await pool.query(
-    `INSERT INTO videos (email, prediction_id, status, input_url, output_url, cost_credits, type)
-     VALUES ($1,$2,$3,$4,$5,$6,$7)
+    `INSERT INTO videos (email, prediction_id, status, input_url, output_url)
+     VALUES ($1,$2,$3,$4,$5)
      ON CONFLICT (prediction_id) DO UPDATE SET
        status=EXCLUDED.status,
        input_url=COALESCE(EXCLUDED.input_url, videos.input_url),
        output_url=COALESCE(EXCLUDED.output_url, videos.output_url),
-       cost_credits=COALESCE(EXCLUDED.cost_credits, videos.cost_credits),
-       type=COALESCE(EXCLUDED.type, videos.type),
        updated_at=now()`,
-    [e, predictionId || null, status || "starting", inputUrl || null, outputUrl || null, costCredits || 0, type || 'video_translation']
+    [e, predictionId || null, status || "starting", inputUrl || null, outputUrl || null]
   );
 }
 
@@ -546,13 +424,6 @@ async function addBalance(email, delta, reason) {
   );
   if (!rows[0]) return { ok: false, code: "NO_USER" };
   return { ok: true, balance: Number(rows[0].balance || 0) };
-}
-
-
-async function getBalance(email) {
-  const e = normEmail(email);
-  const { rows } = await pool.query("SELECT balance FROM users WHERE email=$1", [e]);
-  return rows[0] ? Number(rows[0].balance || 0) : 0;
 }
 
 async function chargeBalance(email, cost) {
@@ -589,67 +460,6 @@ async function chargeBalance(email, cost) {
   }
 }
 
-/**
- * Refund credits for a failed prediction
- * @param {string} predictionId - The prediction ID
- * @param {number} refundAmount - Amount of credits to refund (optional, will use cost_credits from DB if not provided)
- * @returns {Promise<{ok: boolean, refunded?: number, alreadyRefunded?: boolean}>}
- */
-async function refundCreditsForFailure(predictionId, refundAmount = null) {
-  try {
-    // Get video details
-    const { rows } = await pool.query(
-      "SELECT email, cost_credits, refunded FROM videos WHERE prediction_id = $1",
-      [predictionId]
-    );
-    
-    if (!rows[0]) {
-      console.log(`No video found for prediction ${predictionId}`);
-      return { ok: false };
-    }
-    
-    const { email, cost_credits, refunded } = rows[0];
-    
-    // Check if already refunded
-    if (refunded) {
-      console.log(`Credits already refunded for prediction ${predictionId}`);
-      return { ok: true, alreadyRefunded: true };
-    }
-    
-    // Determine refund amount
-    const amount = refundAmount || cost_credits || 0;
-    if (amount <= 0) {
-      console.log(`No credits to refund for prediction ${predictionId}`);
-      return { ok: true, refunded: 0 };
-    }
-    
-    // Refund credits and mark as refunded
-    await pool.query("BEGIN");
-    
-    await pool.query(
-      "UPDATE users SET balance = balance + $1 WHERE email = $2",
-      [amount, email]
-    );
-    
-    await pool.query(
-      "UPDATE videos SET refunded = true WHERE prediction_id = $1",
-      [predictionId]
-    );
-    
-    await pool.query("COMMIT");
-    
-    console.log(`✅ Refunded ${amount} credits to ${email} for failed prediction ${predictionId}`);
-    return { ok: true, refunded: amount };
-    
-  } catch (err) {
-    try {
-      await pool.query("ROLLBACK");
-    } catch {}
-    console.error(`Failed to refund credits for prediction ${predictionId}:`, err);
-    return { ok: false, error: err.message };
-  }
-}
-
 function auth(req, res, next) {
   const h = req.headers.authorization || "";
   const token = h.startsWith("Bearer ") ? h.slice(7) : "";
@@ -663,7 +473,7 @@ function auth(req, res, next) {
 }
 
 // Stripe webhook must use RAW body — define BEFORE express.json
-app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), asyncHandler(async (req, res) => {
+app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   const sig = req.headers["stripe-signature"];
   let event;
   try {
@@ -699,180 +509,60 @@ try {
         await recordPayment({ email, stripeSessionId: sessionId, amountUsd: amountTotal, lypos, status: "completed", invoiceUrl });
         await addBalance(email, lypos);
         console.log("✅ Payment stored + credited LYPOS:", { email, lypos, amountTotal });
-        
-        // Send email notification to admin
-        await sendCreditPurchaseEmail(email, lypos, amountTotal, invoiceUrl);
       } catch (e) {
         console.log("⚠️ Webhook credit failed:", e?.message || e);
       }
     }
   }
 
-  // Handle Apple Pay / Google Pay payments (payment_intent.succeeded)
-  if (event.type === "payment_intent.succeeded") {
-    const paymentIntent = event.data.object;
-    const email = paymentIntent.metadata?.email;
-    const lypos = Number(paymentIntent.metadata?.lypos || 0);
-    const amountUsd = Number(paymentIntent.amount || 0) / 100;
-    const paymentIntentId = paymentIntent.id;
-    
-    let invoiceUrl = null;
-    try {
-      if (paymentIntent.charges?.data?.[0]) {
-        invoiceUrl = paymentIntent.charges.data[0].receipt_url || null;
-      }
-    } catch (e) {
-      invoiceUrl = null;
-    }
-
-    if (email && lypos > 0) {
-      try {
-        // Check if already recorded to avoid duplicates
-        const existing = await pool.query(
-          "SELECT 1 FROM payments WHERE stripe_session_id=$1 LIMIT 1",
-          [paymentIntentId]
-        );
-        
-        if (existing.rows.length === 0) {
-          await recordPayment({ 
-            email, 
-            stripeSessionId: paymentIntentId, 
-            amountUsd, 
-            lypos, 
-            status: "completed", 
-            invoiceUrl 
-          });
-          await addBalance(email, lypos);
-          console.log("✅ Payment Intent processed + credited LYPOS:", { email, lypos, amountUsd });
-          
-          // Send email notification
-          await sendCreditPurchaseEmail(email, lypos, amountUsd, invoiceUrl);
-        } else {
-          console.log("⚠️ Payment Intent already processed:", paymentIntentId);
-        }
-      } catch (e) {
-        console.log("⚠️ Payment Intent webhook failed:", e?.message || e);
-      }
-    }
-  }
-
   res.json({ received: true });
-}));
+});
 
 // JSON for normal routes
-
-/* ---------------------------
-   Basic security & diagnostics
----------------------------- */
-app.use((req, res, next) => {
-  // simple request id
-  const rid = req.headers["x-request-id"] || crypto.randomUUID();
-  res.setHeader("X-Request-Id", rid);
-
-  // security headers (lightweight, no design changes)
-  res.setHeader("X-Content-Type-Options", "nosniff");
-  res.setHeader("X-Frame-Options", "DENY");
-  res.setHeader("Referrer-Policy", "same-origin");
-  res.setHeader("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
-  next();
-});
-
-// CORS Configuration
-app.use((req, res, next) => {
-  const allowedOrigins = [
-    'https://lypo.org',
-    'https://www.lypo.org',
-    'http://localhost:3000',
-    'http://localhost:5500',
-    'http://127.0.0.1:5500'
-  ];
-  
-  const origin = req.headers.origin;
-  if (allowedOrigins.includes(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-  }
-  
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.setHeader('Access-Control-Allow-Credentials', 'true');
-  res.setHeader('Access-Control-Max-Age', '86400'); // 24 hours
-  
-  next();
-});
-
-// Fast OPTIONS response for CORS preflight
-app.options("*", (req, res) => {
-  res.sendStatus(204);
-});
-
 app.use(express.json({ limit: "2mb" }));
 
-// Input sanitization helper
-function sanitizeInput(str) {
-  if (typeof str !== 'string') return str;
-  // Remove potentially dangerous characters
-  return str
-    .replace(/<script[^>]*>.*?<\/script>/gi, '')
-    .replace(/<[^>]+>/g, '')
-    .replace(/javascript:/gi, '')
-    .replace(/on\w+\s*=/gi, '')
-    .trim();
-}
+// ---- Support (send message via Resend)
+app.post("/api/support", async (req, res) => {
+  const fromEmail = String(req.body?.email || "").trim();
+  const subject = String(req.body?.subject || "").trim();
+  const message = String(req.body?.message || "").trim();
 
-// Add cache control for API responses
-app.use((req, res, next) => {
-  // No cache for API endpoints
-  if (req.path.startsWith('/api/')) {
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-    res.setHeader('Pragma', 'no-cache');
-    res.setHeader('Expires', '0');
+  if (!message) return res.status(400).json({ error: "Missing message" });
+
+  // Optional: if user is logged in, capture their email from Bearer token
+  let authedEmail = "";
+  try {
+    const h = req.headers.authorization || "";
+    const token = h.startsWith("Bearer ") ? h.slice(7) : "";
+    if (token) {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      authedEmail = decoded?.email || "";
+    }
+  } catch {
+    // ignore invalid tokens
   }
-  // Cache static assets for 1 year
-  else if (req.path.match(/\.(jpg|jpeg|png|gif|ico|css|js|woff|woff2|ttf|svg)$/)) {
-    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+
+  // Require at least one email source: provided email OR logged-in email
+  if (!fromEmail && !authedEmail) return res.status(400).json({ error: "Missing email" });
+
+  try {
+    const out = await sendSupportEmail({ fromEmail: fromEmail || authedEmail, subject, message, authedEmail });
+    // Always return ok to the client (avoid leaking config), but log reasons
+    if (!out.ok) {
+      console.log("Support email not sent:", out.reason);
+    }
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("Support endpoint error:", e?.message || e);
+    return res.json({ ok: true });
   }
-  next();
 });
 
-
-app.get("/api/health", (req, res) => {
-  res.json({ ok: true, ts: new Date().toISOString() });
-});
-
-
-function isValidEmail(email){
-  const e = String(email || "").trim().toLowerCase();
-  // simple, practical email check
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
-}
-
-// Very small in-memory rate limit (per IP) for auth endpoints
-const __authHits = new Map(); // ip -> {count, resetAt}
-function authRateLimit(req, res, next){
-  const ip = (req.headers["x-forwarded-for"] || req.ip || "").toString().split(",")[0].trim() || "unknown";
-  const now = Date.now();
-  const windowMs = 60_000; // 1 min
-  const max = 20;
-
-  const entry = __authHits.get(ip) || { count: 0, resetAt: now + windowMs };
-  if (now > entry.resetAt) {
-    entry.count = 0;
-    entry.resetAt = now + windowMs;
-  }
-  entry.count += 1;
-  __authHits.set(ip, entry);
-
-  if (entry.count > max) {
-    return res.status(429).json({ error: "RATE_LIMIT", message: "Too many requests. Try again in a minute." });
-  }
-  next();
-}
 
 // ---- Auth routes
-app.post("/api/auth/signup", authRateLimit, asyncHandler(async (req, res) => {
+app.post("/api/auth/signup", async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: "Missing email/password" });
-  if (!isValidEmail(email)) return res.status(400).json({ error: "Invalid email" });
   if (String(password).length < 6) return res.status(400).json({ error: "Password too short (min 6)" });
 
   const e = normEmail(email);
@@ -880,18 +570,43 @@ app.post("/api/auth/signup", authRateLimit, asyncHandler(async (req, res) => {
   if (existing) return res.status(409).json({ error: "Email already registered" });
 
   const passwordHash = await bcrypt.hash(String(password), 10);
-  const row = await createUser(e, passwordHash);
-  
-  // Notify support (non-blocking, controlled by SEND_SIGNUP_EMAILS env var)
-  Promise.resolve(sendSupportNewUserEmail({ email: e, ip: (req.headers["x-forwarded-for"]||req.ip||"").toString().split(",")[0].trim(), ua: req.headers["user-agent"]||"" })).catch((err) => console.error("Support email failed:", err));
+  let row = await createUser(e, passwordHash);
 
-  res.json({ token: signToken(e), user: publicUserRow(row) });
+  // bootstrap first admin (if no admin emails configured and no admins in DB)
+  try {
+    const configured = (process.env.ADMIN_EMAIL || "").trim() || (process.env.ADMIN_EMAILS || "").trim();
+    if (!configured) {
+      const { rows } = await pool.query("SELECT COUNT(*)::int AS c FROM users WHERE is_admin=TRUE");
+      if ((rows?.[0]?.c || 0) === 0) {
+        await pool.query("UPDATE users SET is_admin=TRUE WHERE email=$1", [e]);
+        row = await getUserByEmail(e);
+      }
+    }
+  } catch {}
+
+  res.json({ token: signToken(e, row?.is_admin), user: publicUserRow(row) });
+});
+
+
+
+app.post("/api/auth/verify-email", asyncHandler(async (req, res) => {
+  const email = normEmail(String(req.body.email || ""));
+  const token = String(req.body.token || "").trim();
+  if (!email || !token) return res.status(400).json({ error: "Missing email or token" });
+
+  const row = (await pool.query("SELECT token, email, used_at FROM email_verifications WHERE token=$1 AND email=$2", [token, email])).rows[0];
+  if (!row) return res.status(400).json({ error: "Invalid token" });
+  if (row.used_at) return res.status(400).json({ error: "Token already used" });
+
+  await pool.query("UPDATE email_verifications SET used_at=NOW() WHERE token=$1", [token]);
+  await pool.query("UPDATE users SET is_verified=TRUE WHERE email=$1", [email]);
+
+  res.json({ ok: true });
 }));
 
-app.post("/api/auth/login", authRateLimit, asyncHandler(async (req, res) => {
+app.post("/api/auth/login", async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: "Missing email/password" });
-  if (!isValidEmail(email)) return res.status(400).json({ error: "Invalid email" });
 
   const e = normEmail(email);
   const u = await getUserByEmail(e);
@@ -900,132 +615,15 @@ app.post("/api/auth/login", authRateLimit, asyncHandler(async (req, res) => {
   const ok = await bcrypt.compare(String(password), String(u.password_hash || ""));
   if (!ok) return res.status(401).json({ error: "Invalid credentials" });
 
-  res.json({ token: signToken(e), user: publicUserRow(u) });
-}));
+  res.json({ token: signToken(e, u?.is_admin), user: publicUserRow(u) });
+});
 
-// Google OAuth Login/Signup (Simple version - works with current database)
-app.post("/api/auth/google", authRateLimit, asyncHandler(async (req, res) => {
-  const { credential } = req.body || {};
-  if (!credential) return res.status(400).json({ error: "Missing Google credential" });
-
-  try {
-    // Verify Google token
-    const response = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${credential}`);
-    if (!response.ok) throw new Error("Invalid Google token");
-    
-    const payload = await response.json();
-    
-    // Extract user info from Google token
-    const googleId = payload.sub;
-    const email = normEmail(payload.email);
-    const name = payload.name || "";
-    
-    if (!googleId || !email) {
-      return res.status(400).json({ error: "Invalid Google account data" });
-    }
-
-    // Check if user exists by email
-    let user = await getUserByEmail(email);
-    
-    // If no user exists, create new one (using current database schema)
-    if (!user) {
-      // For Google users, create with a random password (they'll use Google to login)
-      const randomPassword = crypto.randomBytes(32).toString('hex');
-      const passwordHash = await bcrypt.hash(randomPassword, 10);
-      
-      user = await createUser(email, passwordHash);
-      
-      // Notify support (non-blocking, controlled by SEND_SIGNUP_EMAILS env var)
-      Promise.resolve(sendSupportNewUserEmail({ 
-        email, 
-        ip: (req.headers["x-forwarded-for"]||req.ip||"").toString().split(",")[0].trim(), 
-        ua: req.headers["user-agent"]||"" 
-      })).catch((err) => console.error("Support email failed:", err));
-    }
-
-    res.json({ token: signToken(email), user: publicUserRow(user) });
-  } catch (error) {
-    console.error("Google auth error:", error);
-    res.status(401).json({ error: "Google authentication failed" });
-  }
-}));
-
-app.get("/api/auth/me", auth, asyncHandler(async (req, res) => {
+app.get("/api/auth/me", auth, async (req, res) => {
   const email = req.user?.email;
   const u = await getUserByEmail(email);
   if (!u) return res.status(401).json({ error: "Invalid user" });
   res.json({ user: publicUserRow(u) });
-}));
-
-// ---- Support Contact Form
-app.post("/api/support", asyncHandler(async (req, res) => {
-  const { email, subject, message } = req.body || {};
-  
-  // Validate inputs
-  if (!message || String(message).trim().length === 0) {
-    return res.status(400).json({ error: "Message is required" });
-  }
-  
-  // Get user email if authenticated
-  let fromEmail = String(email || "").trim();
-  if (req.headers.authorization) {
-    try {
-      const token = req.headers.authorization.replace(/^Bearer\s+/i, "");
-      const decoded = jwt.verify(token, JWT_SECRET);
-      if (decoded.email) fromEmail = decoded.email;
-    } catch (e) {
-      // Not authenticated, use provided email
-    }
-  }
-  
-  if (!fromEmail) {
-    return res.status(400).json({ error: "Email is required" });
-  }
-  
-  // Send email to support using Resend
-  const apiKey = process.env.RESEND_API_KEY || "";
-  const to = process.env.SUPPORT_EMAIL || "";
-  const from = process.env.EMAIL_FROM || "Lypo <no-reply@lypo.org>";
-  
-  if (!apiKey || !to) {
-    console.warn("⚠️ Support email not configured (missing RESEND_API_KEY or SUPPORT_EMAIL)");
-    return res.status(500).json({ error: "Support email not configured" });
-  }
-  
-  const resend = new Resend(apiKey);
-  const emailSubject = subject ? `Support: ${subject}` : "Support Message";
-  const html = `
-    <div style="font-family:Arial,sans-serif;line-height:1.6">
-      <h2 style="margin:0 0 12px 0;">Support Message</h2>
-      <p style="margin:0 0 8px 0;"><strong>From:</strong> ${fromEmail}</p>
-      ${subject ? `<p style="margin:0 0 8px 0;"><strong>Subject:</strong> ${subject}</p>` : ''}
-      <p style="margin:0 0 8px 0;"><strong>Message:</strong></p>
-      <div style="padding:12px; background:#f5f5f5; border-left:3px solid #0066cc;">
-        ${String(message).replace(/\n/g, '<br>')}
-      </div>
-      <p style="margin:12px 0 0 0;color:#666;">
-        Sent from: ${req.headers['user-agent'] || 'Unknown browser'}<br>
-        IP: ${(req.headers["x-forwarded-for"]||req.ip||"").toString().split(",")[0].trim() || 'Unknown'}<br>
-        Time: ${new Date().toISOString()}
-      </p>
-    </div>
-  `;
-  
-  try {
-    await resend.emails.send({ 
-      from, 
-      to, 
-      subject: emailSubject, 
-      html,
-      replyTo: fromEmail // Allow direct reply
-    });
-    
-    res.json({ ok: true, message: "Message sent successfully" });
-  } catch (err) {
-    console.error("❌ Resend error:", err);
-    res.status(500).json({ error: "Failed to send email" });
-  }
-}));
+});
 
 // ---- Credits
 
@@ -1043,11 +641,58 @@ function isAdminEmail(email) {
   return admins.has(String(email).toLowerCase());
 }
 
-app.get("/api/admin/status", auth, asyncHandler(async (req, res) => {
+app.get("/api/admin/status", auth, async (req, res) => {
   return res.json({ isAdmin: isAdminEmail(req.user?.email), email: req.user?.email || null });
+});
+
+
+app.get("/api/admin/users", auth, requireAdmin, asyncHandler(async (req, res) => {
+  const q = String(req.query.q || "").trim().toLowerCase();
+  const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit || "50"), 10) || 50));
+  const offset = Math.max(0, parseInt(String(req.query.offset || "0"), 10) || 0);
+
+  const params = [];
+  let where = "";
+  if (q) {
+    params.push(`%${q}%`);
+    where = `WHERE lower(email) LIKE $${params.length}`;
+  }
+  params.push(limit);
+  params.push(offset);
+
+  const { rows } = await pool.query(
+    `SELECT email, balance, is_admin, created_at FROM users ${where} ORDER BY created_at DESC LIMIT $${params.length-1} OFFSET $${params.length}`,
+    params
+  );
+  res.json({ users: rows });
 }));
 
-app.post("/api/admin/add-credits", auth, asyncHandler(async (req, res) => {
+app.get("/api/admin/user-lookup", auth, requireAdmin, asyncHandler(async (req, res) => {
+  const email = normEmail(String(req.query.email || ""));
+  if (!email) return res.status(400).json({ error: "Email required" });
+
+  const u = await getUserByEmail(email);
+  if (!u) return res.status(404).json({ error: "User not found" });
+
+  const payments = (await pool.query(
+    "SELECT stripe_session_id, amount_usd, lypos, status, invoice_url, created_at FROM payments WHERE email=$1 ORDER BY created_at DESC LIMIT 100",
+    [email]
+  )).rows;
+
+  const videos = (await pool.query(
+    "SELECT prediction_id, status, input_url, output_url, cost_credits, refunded, created_at, updated_at FROM videos WHERE email=$1 ORDER BY created_at DESC LIMIT 100",
+    [email]
+  )).rows;
+
+  res.json({
+    user: { email: u.email, balance: u.balance, is_admin: u.is_admin, created_at: u.created_at },
+    payments,
+    videos
+  });
+}));
+
+
+app.post("/api/admin/add-credits", auth, async (req, res) => {
   if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
 
   const email = String(req.body?.email || "").trim().toLowerCase();
@@ -1061,16 +706,16 @@ app.post("/api/admin/add-credits", auth, asyncHandler(async (req, res) => {
   if (!out.ok) return res.status(400).json({ error: out.code || "FAILED" });
 
   return res.json({ ok: true, user: { email, balance: out.balance } });
-}));
+});
 
-app.get("/api/credits", auth, asyncHandler(async (req, res) => {
+app.get("/api/credits", auth, async (req, res) => {
   const email = req.user.email;
   const u = await getUserByEmail(email);
   if (!u) return res.status(401).json({ error: "Invalid user" });
   res.json({ balance: Number(u.balance || 0) });
-}));
+});
 
-app.post("/api/credits/charge", auth, asyncHandler(async (req, res) => {
+app.post("/api/credits/charge", auth, async (req, res) => {
   const email = req.user.email;
   const seconds = Number(req.body?.seconds || 0);
   const s = Math.max(1, Math.ceil(seconds));
@@ -1082,7 +727,7 @@ app.post("/api/credits/charge", auth, asyncHandler(async (req, res) => {
     return res.status(402).json({ error: "INSUFFICIENT_CREDITS", required: cost, balance: result.balance });
   }
   res.json({ charged: cost, remaining: result.balance });
-}));
+});
 
 
 // ---- Account dashboard
@@ -1097,64 +742,17 @@ app.get("/api/account/payments", auth, asyncHandler(async (req, res) => {
 
 app.get("/api/account/videos", auth, asyncHandler(async (req, res) => {
   const email = normEmail(req.user.email);
-  
-  // Get videos from videos table
-  const { rows: videoRows } = await pool.query(
-    "SELECT prediction_id, status, input_url, output_url, type, cost_credits, created_at FROM videos WHERE email=$1 ORDER BY created_at DESC LIMIT 100",
+  const { rows } = await pool.query(
+    "SELECT prediction_id, status, input_url, output_url, created_at FROM videos WHERE email=$1 ORDER BY created_at DESC LIMIT 100",
     [email]
   );
-  
-  // Get voiceover jobs from jobs table
-  const { rows: jobRows } = await pool.query(
-    "SELECT job_id as prediction_id, status, NULL as input_url, output_url, tool as type, credits_used as cost_credits, created_at FROM jobs WHERE user_email=$1 AND tool='voiceover' ORDER BY created_at DESC LIMIT 100",
-    [email]
-  );
-  
-  // Combine and sort by created_at
-  const combined = [...videoRows, ...jobRows].sort((a, b) => 
-    new Date(b.created_at) - new Date(a.created_at)
-  ).slice(0, 100);
-  
-  res.json({ videos: combined });
+  res.json({ videos: rows });
 }));
 
-
-// ---- Stripe Payment Intent for Apple Pay / Google Pay
-app.post("/api/stripe/create-payment-intent", auth, asyncHandler(async (req, res) => {
-  const usd = Number(req.body?.usd || 0);
-  if (!Number.isFinite(usd) || usd <= 0) return res.status(400).json({ error: "Invalid usd" });
-
-  const email = req.user.email;
-  const lypos = Math.round(usd * LYPOS_PER_USD);
-
-  try {
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: Math.round(usd * 100), // Convert to cents
-      currency: 'usd',
-      receipt_email: email, // Fixed: was customer_email, should be receipt_email
-      description: `${lypos} LYPO Credits`,
-      metadata: {
-        email,
-        lypos: String(lypos),
-        usd: String(usd)
-      },
-      automatic_payment_methods: {
-        enabled: true,
-      },
-    });
-
-    res.json({ 
-      clientSecret: paymentIntent.client_secret,
-      paymentIntentId: paymentIntent.id 
-    });
-  } catch (error) {
-    console.error('❌ Payment Intent creation error:', error);
-    res.status(500).json({ error: error.message });
-  }
-}));
 
 // ---- Stripe checkout: buy LYPOS
-app.post("/api/stripe/create-checkout-session", auth, asyncHandler(async (req, res) => {
+app.post("/api/stripe/create-checkout-session", auth, async (req, res) => {
+  const frontendBase = (process.env.FRONTEND_URL || "").trim() || (req.headers.origin || "").trim() || FRONTEND_URL;
   const usd = Number(req.body?.usd || 0);
   if (!Number.isFinite(usd) || usd <= 0) return res.status(400).json({ error: "Invalid usd" });
 
@@ -1164,8 +762,6 @@ app.post("/api/stripe/create-checkout-session", auth, asyncHandler(async (req, r
   const session = await stripe.checkout.sessions.create({
     mode: "payment",
     customer_email: email,
-    // Don't specify payment_method_types - let Stripe auto-enable all available methods
-    // This includes: card, Google Pay, Apple Pay, Link (based on user's device/browser)
     line_items: [
       {
         price_data: {
@@ -1177,14 +773,54 @@ app.post("/api/stripe/create-checkout-session", auth, asyncHandler(async (req, r
       }
     ],
     metadata: { email, lypos: String(lypos) },
-    success_url: `${FRONTEND_URL}/dashboard.html?paid=1&session_id={CHECKOUT_SESSION_ID}`,
-    cancel_url: `${FRONTEND_URL}/dashboard.html?paid=0`,
-    automatic_tax: { enabled: false },
-    billing_address_collection: 'auto'
+    success_url: `${frontendBase}/dashboard.html?paid=1&session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${frontendBase}/dashboard.html?paid=0`
   });
 
   res.json({ url: session.url });
-}));
+});
+
+
+
+
+app.get("/api/account/videos", auth, async (req, res) => {
+  const email = normEmail(req.user.email);
+  const { rows } = await pool.query(
+    "SELECT prediction_id, status, input_url, output_url, created_at FROM videos WHERE email=$1 ORDER BY created_at DESC LIMIT 100",
+    [email]
+  );
+  res.json({ videos: rows });
+});
+
+
+// ---- Stripe checkout: buy LYPOS
+app.post("/api/stripe/create-checkout-session", auth, async (req, res) => {
+  const frontendBase = (process.env.FRONTEND_URL || "").trim() || (req.headers.origin || "").trim() || (FRONTEND_URL || "").trim();
+  const usd = Number(req.body?.usd || 0);
+  if (!Number.isFinite(usd) || usd <= 0) return res.status(400).json({ error: "Invalid usd" });
+
+  const email = req.user.email;
+  const lypos = Math.round(usd * LYPOS_PER_USD);
+
+  const session = await stripe.checkout.sessions.create({
+    mode: "payment",
+    customer_email: email,
+    line_items: [
+      {
+        price_data: {
+          currency: "usd",
+          unit_amount: Math.round(usd * 100),
+          product_data: { name: `${lypos} Credits` }
+        },
+        quantity: 1
+      }
+    ],
+    metadata: { email, lypos: String(lypos) },
+    success_url: `${frontendBase}/dashboard.html?paid=1&session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${frontendBase}/dashboard.html?paid=0`});
+
+  res.json({ url: session.url });
+});
 
 // Confirm Checkout Session on return (fallback if webhook is not configured)
 // Idempotent: will not double-credit if already recorded.
@@ -1193,7 +829,7 @@ app.get("/api/stripe/confirm", auth, asyncHandler(async (req, res) => {
   if (!sessionId) return res.status(400).json({ error: "Missing session_id" });
 
   // Retrieve the session from Stripe
-  const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ["payment_intent", "payment_intent.charges", "payment_intent.latest_charge"] });
+  const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ["payment_intent", "payment_intent.latest_charge"] });
 
   // Must belong to the logged-in user
   const email = req.user.email;
@@ -1222,25 +858,17 @@ app.get("/api/stripe/confirm", auth, asyncHandler(async (req, res) => {
       invoiceUrl = inv.invoice_pdf || inv.hosted_invoice_url || null;
     } else {
       const pi = session.payment_intent;
-const charge = pi?.charges?.data?.[0];
-invoiceUrl = charge?.receipt_url || null;
-
-// Fallback: retrieve latest_charge if charges list isn't present
-if (!invoiceUrl && pi?.latest_charge) {
-  try {
-    const ch = await stripe.charges.retrieve(
-      typeof pi.latest_charge === "string" ? pi.latest_charge : pi.latest_charge.id
-    );
-    invoiceUrl = ch?.receipt_url || invoiceUrl;
-  } catch {}
-}
+      let charge = pi?.latest_charge;
+      if (charge && typeof charge === "string") {
+        charge = await stripe.charges.retrieve(charge);
+      }
+      invoiceUrl = charge?.receipt_url || null;
     }
   } catch {
     invoiceUrl = null;
   }
 
   // Record payment + credit balance (idempotent because stripe_session_id is UNIQUE)
-  let balRes = null;
   try {
     await recordPayment({
       email,
@@ -1250,20 +878,17 @@ if (!invoiceUrl && pi?.latest_charge) {
       status: "completed",
       invoiceUrl
     });
-    balRes = await addBalance(email, credits);
-    
-    // Send email notification to admin
-    await sendCreditPurchaseEmail(email, credits, amountTotal, invoiceUrl);
-} catch (e) {
-  // If already recorded, ignore; still return current balance
-  const msg = String(e?.message || "");
-  if (!msg.toLowerCase().includes("duplicate") && !msg.toLowerCase().includes("unique")) {
-    console.log("⚠️ confirm payment failed:", msg);
+    await addBalance(email, credits);
+  } catch (e) {
+    // If already recorded, ignore; still return current balance
+    const msg = String(e?.message || "");
+    if (!msg.toLowerCase().includes("duplicate") && !msg.toLowerCase().includes("unique")) {
+      console.log("⚠️ confirm payment failed:", msg);
+    }
   }
-}
 
-const bal = (balRes && balRes.ok) ? balRes.balance : await getBalance(email);
-  res.json({ ok: true, balance: bal, invoice_url: invoiceUrl });
+  const bal = await getBalance(email);
+  res.json({ ok: true, balance: bal, invoice_url: invoiceUrl, invoiceUrl });
 }));
 
 /* ---------------------------
@@ -1288,6 +913,11 @@ function requireEnv(name, value) {
   }
   return value;
 }
+
+
+/* ---------------------------
+   ENV
+---------------------------- */
 
 /* ---------------------------
    Replicate client
@@ -1424,7 +1054,7 @@ app.post("/api/dub-upload", auth, (req, res) => {
         const videoUrl = `${base}/${key}`;
 
         const prediction = await createHeygenPrediction({ videoUrl, outputLanguage });
-        await upsertVideo({ email, predictionId: prediction.id, status: prediction.status, inputUrl: videoUrl, costCredits: cost, type: 'video_translation' });
+        await upsertVideo({ email, predictionId: prediction.id, status: prediction.status, inputUrl: videoUrl });
 
         res.json({
           id: prediction.id,
@@ -1434,23 +1064,6 @@ app.post("/api/dub-upload", auth, (req, res) => {
         });
       } catch (e) {
         console.error(e);
-        
-        // Refund credits if generation failed after charging
-        try {
-          const email = req.user?.email;
-          const seconds = Math.max(1, Number(secondsField || 0));
-          const refundAmount = Math.max(1, Math.ceil(seconds)) * CREDITS_PER_SECOND;
-          if (email && refundAmount > 0) {
-            await pool.query(
-              "UPDATE users SET balance = balance + $1 WHERE email = $2",
-              [refundAmount, email]
-            );
-            console.log(`Refunded ${refundAmount} credits to ${email} due to upload/generation error`);
-          }
-        } catch (refundErr) {
-          console.error("Failed to refund credits:", refundErr);
-        }
-        
         res.status(e.statusCode || 500).json({ error: e?.message || "Upload/Start failed" });
       }
     });
@@ -1465,7 +1078,7 @@ app.post("/api/dub-upload", auth, (req, res) => {
 /**
  * GET /api/dub/:id
  */
-app.get("/api/dub/:id", auth, asyncHandler(async (req, res) => {
+app.get("/api/dub/:id", auth, async (req, res) => {
   try {
     requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
 
@@ -1492,11 +1105,6 @@ app.get("/api/dub/:id", auth, asyncHandler(async (req, res) => {
 
     try {
       await upsertVideo({ email: req.user.email, predictionId: predictionId, status: prediction.status, outputUrl });
-      
-      // Automatically refund credits if prediction failed
-      if (prediction.status === "failed" || prediction.status === "canceled") {
-        await refundCreditsForFailure(predictionId);
-      }
     } catch (e) {
       console.log("video upsert failed", e?.message || e);
     }
@@ -1511,205 +1119,7 @@ app.get("/api/dub/:id", auth, asyncHandler(async (req, res) => {
     console.error(e);
     res.status(500).json({ error: e?.message || "Internal error" });
   }
-}));
-
-/* ---------------------------
-   VOICEOVER TOOL (Chatterbox-Turbo by Resemble AI)
-   POST /api/voiceover/generate
-   GET  /api/voiceover/status/:jobId
-   
-   Model: resemble-ai/chatterbox-turbo
-   Features: Fast TTS, reference audio cloning, paralinguistic tags
----------------------------- */
-
-app.post("/api/voiceover/generate", auth, asyncHandler(async (req, res) => {
-  try {
-    requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
-    
-    const { 
-      text, 
-      voice = "Luna",
-      exaggeration = 0.5,
-      temperature = 0.5, // Maps to cfg parameter
-      pitch = 0
-    } = req.body;
-    const userEmail = req.user.email;
-    
-    if (!text || text.trim().length === 0) {
-      return res.status(400).json({ error: "Text is required" });
-    }
-    
-    // Calculate cost: 50 credits per 1000 characters
-    const charCount = text.trim().length;
-    const cost = Math.ceil((charCount / 1000) * 50);
-    
-    console.log(`🎙️ Chatterbox-Pro voiceover request from ${userEmail}: ${charCount} chars = ${cost} credits`);
-    console.log(`   Voice: ${voice}, Exaggeration: ${exaggeration}, Temperature (cfg): ${temperature}, Pitch: ${pitch}`);
-    
-    // Check user balance
-    const balanceQuery = await pool.query(
-      "SELECT balance FROM users WHERE email = $1",
-      [userEmail]
-    );
-    
-    if (balanceQuery.rows.length === 0) {
-      return res.status(404).json({ error: "User not found" });
-    }
-    
-    const currentBalance = balanceQuery.rows[0].balance || 0;
-    
-    if (currentBalance < cost) {
-      console.log(`❌ Insufficient balance: ${currentBalance} < ${cost}`);
-      return res.status(402).json({ 
-        error: `Insufficient credits. Need ${cost}, have ${currentBalance}`,
-        required: cost,
-        current: currentBalance
-      });
-    }
-    
-    // Deduct credits immediately
-    await pool.query(
-      "UPDATE users SET balance = balance - $1 WHERE email = $2",
-      [cost, userEmail]
-    );
-    
-    const newBalance = currentBalance - cost;
-    console.log(`✅ Deducted ${cost} credits. New balance: ${newBalance}`);
-    
-    // Initialize Replicate
-    const replicate = new Replicate({
-      auth: REPLICATE_API_TOKEN,
-    });
-    
-    // Start Chatterbox-Pro TTS prediction
-    console.log(`🚀 Starting Chatterbox-Pro TTS prediction...`);
-    console.log(`   Text length: ${text.trim().length} chars`);
-    console.log(`   Voice: ${voice}`);
-    console.log(`   Exaggeration: ${exaggeration}`);
-    console.log(`   Temperature (cfg): ${temperature}`);
-    console.log(`   Pitch: ${pitch}`);
-    
-    // Build input for Chatterbox-Pro
-    // NOTE: Chatterbox-Pro uses 'prompt' not 'text'
-    const chatterboxInput = {
-      prompt: text.trim(), // Chatterbox-Pro requires 'prompt' field
-      voice: voice || "Luna", // Default to Luna if no voice selected
-      exaggeration: exaggeration,
-      cfg: temperature, // Temperature maps to cfg (classifier-free guidance)
-      pitch: pitch, // API requires pitch as enum: "x-low", "low", "medium", "high", "x-high"
-    };
-    
-    console.log(`   🎤 Voice: ${chatterboxInput.voice}`);
-    console.log(`   🎭 Exaggeration: ${exaggeration}`);
-    console.log(`   🎚️ CFG (Temperature): ${temperature}`);
-    console.log(`   🎵 Pitch: ${pitch}`);
-    
-    const prediction = await replicate.predictions.create({
-      version: "301e12652e84fbba1524e5f2758a9a92c6bd205792304f53c057b7f9ab091342", // Chatterbox-Pro latest
-      input: chatterboxInput,
-    });
-    
-    const jobId = prediction.id;
-    
-    console.log(`✅ Chatterbox-Pro prediction created: ${jobId}`);
-    console.log(`   Initial status: ${prediction.status}`);
-    
-    // Store job info in database
-    await pool.query(
-      `INSERT INTO jobs (job_id, user_email, status, tool, credits_used, created_at)
-       VALUES ($1, $2, $3, $4, $5, NOW())
-       ON CONFLICT (job_id) 
-       DO UPDATE SET status = $3, updated_at = NOW()`,
-      [jobId, userEmail, prediction.status, "voiceover", cost]
-    );
-    
-    res.json({ 
-      jobId, 
-      status: prediction.status,
-      cost,
-      remainingCredits: newBalance
-    });
-    
-  } catch (error) {
-    console.error("❌ Voiceover generation error:", error);
-    console.error("   Full error:", JSON.stringify(error, null, 2));
-    res.status(500).json({ 
-      error: error.message || "Failed to generate voiceover" 
-    });
-  }
-}));
-
-app.get("/api/voiceover/status/:jobId", auth, asyncHandler(async (req, res) => {
-  const { jobId } = req.params;
-  const userEmail = req.user.email;
-  
-  console.log(`📊 Checking voiceover status for job ${jobId}`);
-  
-  // Query Replicate directly
-  const replicate = new Replicate({
-    auth: REPLICATE_API_TOKEN,
-  });
-  
-  const prediction = await replicate.predictions.get(jobId);
-  console.log(`📊 Job ${jobId} status: ${prediction.status}`);
-  
-  if (prediction.error) {
-    console.error(`❌ Prediction error:`, prediction.error);
-  }
-  
-  if (prediction.logs) {
-    console.log(`📝 Prediction logs:`, prediction.logs);
-  }
-  
-  // Update job status in database
-  await pool.query(
-    `UPDATE jobs SET status = $1, updated_at = NOW() WHERE job_id = $2`,
-    [prediction.status, jobId]
-  );
-  
-  // If completed successfully
-  if (prediction.status === "succeeded" && prediction.output) {
-    console.log(`✅ Voiceover completed: ${jobId}`);
-    
-    // Get user's current balance
-    const balanceQuery = await pool.query(
-      "SELECT balance FROM users WHERE email = $1",
-      [userEmail]
-    );
-    
-    const currentBalance = balanceQuery.rows.length > 0 
-      ? balanceQuery.rows[0].balance 
-      : 0;
-    
-    // Store output URL in database
-    await pool.query(
-      `UPDATE jobs SET output_url = $1 WHERE job_id = $2`,
-      [prediction.output, jobId]
-    );
-    
-    return res.json({
-      status: "completed",
-      audioUrl: prediction.output,
-      remainingCredits: currentBalance
-    });
-  }
-  
-  // If failed, refund credits
-  if (prediction.status === "failed" || prediction.status === "canceled") {
-    console.log(`❌ Voiceover failed: ${jobId}`);
-    await refundCreditsForFailure(jobId);
-    
-    return res.json({
-      status: "failed",
-      error: prediction.error || "Generation failed"
-    });
-  }
-  
-  // Still processing
-  res.json({
-    status: prediction.status
-  });
-}));
+});
 
 const PORT = process.env.PORT || 3000;
 
@@ -1722,683 +1132,146 @@ initDb()
     console.error("❌ DB init failed", e);
     process.exit(1);
   });
-
-// ---- Public blog
-app.get("/api/blog/posts", asyncHandler(async (req, res) => {
-  const rows = (await pool.query(
-    "SELECT id, title, slug, excerpt, cover_url, video_url, content_html, created_at, updated_at FROM blog_posts WHERE status='published' ORDER BY created_at DESC LIMIT 200"
-  )).rows;
-  res.json({ posts: rows });
-}));
-
-app.get("/api/blog/posts/:slug", asyncHandler(async (req, res) => {
-  const slug = String(req.params.slug || "").trim();
-  const row = (await pool.query(
-    "SELECT id, title, slug, excerpt, cover_url, video_url, content_html, created_at, updated_at FROM blog_posts WHERE status='published' AND slug=$1 LIMIT 1",
-    [slug]
-  )).rows[0];
-  if (!row) return res.status(404).json({ error: "NOT_FOUND" });
-  res.json({ post: row });
-}));
-
-// ---- Admin blog
-app.get("/api/admin/blog/posts", auth, asyncHandler(async (req, res) => {
-  if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
-  const rows = (await pool.query(
-    "SELECT id, title, slug, excerpt, cover_url, video_url, content_html, status, created_at, updated_at FROM blog_posts ORDER BY created_at DESC LIMIT 500"
-  )).rows;
-  res.json({ posts: rows });
-}));
-
-app.get("/api/admin/blog/posts/:id", auth, asyncHandler(async (req, res) => {
-  if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: "BAD_ID" });
-  const row = (await pool.query(
-    "SELECT id, title, slug, excerpt, cover_url, video_url, content_html, status, created_at, updated_at FROM blog_posts WHERE id=$1 LIMIT 1",
-    [id]
-  )).rows[0];
-  if (!row) return res.status(404).json({ error: "NOT_FOUND" });
-  res.json({ post: row });
-}));
-
-app.post("/api/admin/blog/posts", auth, asyncHandler(async (req, res) => {
-  if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
-  const title = String(req.body?.title || "").trim();
-  const slug = String(req.body?.slug || "").trim();
-  const excerpt = String(req.body?.excerpt || "");
-  const cover_url = String(req.body?.cover_url || "");
-  const video_url = String(req.body?.video_url || "");
-  const content_html = String(req.body?.content_html || "");
-  const status = String(req.body?.status || "draft");
-  if (!title || !slug) return res.status(400).json({ error: "MISSING_FIELDS" });
-  const row = (await pool.query(
-    "INSERT INTO blog_posts (title, slug, excerpt, cover_url, video_url, content_html, status) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *",
-    [title, slug, excerpt, cover_url, video_url, content_html, status]
-  )).rows[0];
-  res.json({ post: row });
-}));
-
-app.put("/api/admin/blog/posts/:id", auth, asyncHandler(async (req, res) => {
-  if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: "BAD_ID" });
-  const title = String(req.body?.title || "").trim();
-  const slug = String(req.body?.slug || "").trim();
-  const excerpt = String(req.body?.excerpt || "");
-  const cover_url = String(req.body?.cover_url || "");
-  const video_url = String(req.body?.video_url || "");
-  const content_html = String(req.body?.content_html || "");
-  const status = String(req.body?.status || "draft");
-  if (!title || !slug) return res.status(400).json({ error: "MISSING_FIELDS" });
-  const row = (await pool.query(
-    "UPDATE blog_posts SET title=$1, slug=$2, excerpt=$3, cover_url=$4, video_url=$5, content_html=$6, status=$7, updated_at=NOW() WHERE id=$8 RETURNING *",
-    [title, slug, excerpt, cover_url, video_url, content_html, status, id]
-  )).rows[0];
-  if (!row) return res.status(404).json({ error: "NOT_FOUND" });
-  res.json({ post: row });
-}));
-
-app.delete("/api/admin/blog/posts/:id", auth, asyncHandler(async (req, res) => {
-  if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
-  const id = Number(req.params.id);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: "BAD_ID" });
-  await pool.query("DELETE FROM blog_posts WHERE id=$1", [id]);
-  res.json({ ok: true });
-}));
-
-// ---- Admin: list users
-app.get("/api/admin/users", auth, asyncHandler(async (req, res) => {
-  if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
-  const limit = Math.min(Math.max(parseInt(req.query?.limit || "50", 10) || 50, 1), 200);
-  const offset = Math.max(parseInt(req.query?.offset || "0", 10) || 0, 0);
-  const q = String(req.query?.q || "").trim();
-
-  const sqlBase = "SELECT email, balance, created_at FROM users";
-  const sqlWhere = q ? " WHERE email ILIKE $1" : "";
-  const sqlOrder = " ORDER BY created_at DESC";
-  const sqlLimit = q ? " LIMIT $2 OFFSET $3" : " LIMIT $1 OFFSET $2";
-  const params = q ? [`%${q}%`, limit, offset] : [limit, offset];
-
-  const rows = (await pool.query(sqlBase + sqlWhere + sqlOrder + sqlLimit, params)).rows;
-  res.json({ users: rows.map(u => ({ email: u.email, balance: Number(u.balance||0), created_at: u.created_at, is_admin: isAdminEmail(u.email) })), limit, offset, q });
-}));
-
-app.put("/api/admin/user-update", auth, asyncHandler(async (req, res) => {
-  if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
-  const email = normEmail(String(req.body?.email || ""));
-  const balanceRaw = req.body?.balance;
-  if (!email) return res.status(400).json({ error: "MISSING_EMAIL" });
-  if (balanceRaw === undefined || balanceRaw === null || balanceRaw === "") return res.status(400).json({ error: "MISSING_BALANCE" });
-  const balance = Number(balanceRaw);
-  if (!Number.isFinite(balance) || balance < 0) return res.status(400).json({ error: "INVALID_BALANCE" });
-
-  const u = await getUserByEmail(email);
-  if (!u) return res.status(404).json({ error: "USER_NOT_FOUND" });
-
-  await pool.query("UPDATE users SET balance=$1 WHERE email=$2", [Math.floor(balance), email]);
-  const updated = await getUserByEmail(email);
-  res.json({ ok: true, user: { email: updated.email, balance: Number(updated.balance||0), created_at: updated.created_at, is_admin: isAdminEmail(updated.email) } });
-}));
-
-app.delete("/api/admin/user-delete", auth, asyncHandler(async (req, res) => {
-  if (!isAdminEmail(req.user?.email)) return res.status(403).json({ error: "NOT_AUTHORIZED" });
-  const email = normEmail(String(req.query?.email || req.body?.email || ""));
-  if (!email) return res.status(400).json({ error: "MISSING_EMAIL" });
-
-  const u = await getUserByEmail(email);
-  if (!u) return res.status(404).json({ error: "USER_NOT_FOUND" });
-
-  try { await pool.query("DELETE FROM videos WHERE email=$1", [email]); } catch {}
-  try { await pool.query("DELETE FROM payments WHERE email=$1", [email]); } catch {}
-  try { await pool.query("DELETE FROM password_resets WHERE email=$1", [email]); } catch {}
-  await pool.query("DELETE FROM users WHERE email=$1", [email]);
-
-  res.json({ ok: true });
-}));
+(async () => {
+  try { await ensureBlogTables(); } catch (e) { console.error('Blog table init failed:', e); }
+})();
 
 
 /* ---------------------------
-   ERROR HANDLER
+   BLOG (public)
 ---------------------------- */
-app.use((err, req, res, next) => {
-  console.error("🔥 Unhandled error:", err);
-  
-  // Ensure CORS headers are set even on errors
-  const origin = req.headers.origin;
-  if (origin && (CORS_ALLOW_ALL || allowedOrigins.has(origin))) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Access-Control-Allow-Credentials", "true");
-    res.setHeader("Vary", "Origin");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH");
-  } else if (!origin) {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-  }
-  
-  res.status(err.statusCode || 500).json({
-    error: "SERVER_ERROR",
-    message: err.message || "Unknown error"
-  });
-});
-
-
-// Process-level safety (logs only; keeps Render logs useful)
-process.on("unhandledRejection", (reason) => {
-  console.error("🔥 UnhandledRejection:", reason);
-});
-process.on("uncaughtException", (err) => {
-  console.error("🔥 UncaughtException:", err);
-});
-
-// ========================================
-// TIKTOK CAPTIONS API
-// ========================================
-
-/**
- * POST /api/tiktok-captions
- * Upload video and generate captions/subtitles
- * Cost: 50 credits per video
- */
-app.post("/api/tiktok-captions", auth, (req, res) => {
+app.get("/api/blog/posts", async (req, res) => {
   try {
-    requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
-    
-    requireEnv("S3_ENDPOINT", S3_ENDPOINT);
-    requireEnv("S3_ACCESS_KEY_ID", S3_ACCESS_KEY_ID);
-    requireEnv("S3_SECRET_ACCESS_KEY", S3_SECRET_ACCESS_KEY);
-    requireEnv("S3_BUCKET", S3_BUCKET);
-    requireEnv("PUBLIC_BASE_URL", PUBLIC_BASE_URL);
-
-    const bb = Busboy({
-      headers: req.headers,
-      limits: { fileSize: 200 * 1024 * 1024 } // 200MB
-    });
-
-    const TIKTOK_COST = 50; // Fixed cost - defined at top level
-    const email = req.user.email; // User email from auth middleware
-    
-    let fileInfo = null;
-    let chunks = [];
-    let captionSettings = { 
-      size: 50, 
-      textColor: "#FFFFFF", 
-      highlightColor: "#8B5CF6" 
-    }; // Defaults
-
-    bb.on("field", (name, value) => {
-      // Capture caption settings from form
-      if (name === "caption_size") {
-        const size = parseInt(value, 10);
-        captionSettings.size = (size >= 15 && size <= 70) ? size : 50; // Validate range
-      }
-      if (name === "text_color") {
-        captionSettings.textColor = value || "#FFFFFF";
-      }
-      if (name === "highlight_color") {
-        captionSettings.highlightColor = value || "#8B5CF6";
-      }
-    });
-
-    bb.on("file", (name, file, info) => {
-      if (name !== "video") {
-        file.resume();
-        return;
-      }
-      fileInfo = info;
-      chunks = [];
-      file.on("data", (d) => chunks.push(d));
-      file.on("limit", () => { chunks = []; });
-      file.on("error", (e) => { console.error("Upload stream error:", e); });
-    });
-
-    bb.on("finish", async () => {
-      try {
-        if (!fileInfo) return res.status(400).json({ error: "Missing video file (field name: video)" });
-        const charge = await chargeBalance(email, TIKTOK_COST);
-        
-        if (!charge.ok && charge.code === "NO_USER") {
-          return res.status(401).json({ error: "Invalid user" });
-        }
-        if (!charge.ok && charge.code === "INSUFFICIENT") {
-          return res.status(402).json({ 
-            error: "INSUFFICIENT_CREDITS", 
-            required: TIKTOK_COST, 
-            balance: charge.balance 
-          });
-        }
-
-        let body = Buffer.concat(chunks);
-        if (!body.length) {
-          return res.status(400).json({ error: "Empty upload or file too large" });
-        }
-
-        const original = fileInfo.filename || "video.mp4";
-        const fileSizeMB = body.length / 1024 / 1024;
-        console.log(`📹 Original video: ${original} (${fileSizeMB.toFixed(2)} MB)`);
-
-        // Check if file is too large for conversion on free tier (>50MB risky)
-        const MAX_CONVERSION_SIZE = 50; // MB - Conservative for 512MB RAM
-        const shouldAttemptConversion = fileSizeMB <= MAX_CONVERSION_SIZE;
-        
-        if (!shouldAttemptConversion) {
-          console.warn(`⚠️ Video too large for conversion (${fileSizeMB.toFixed(2)} MB > ${MAX_CONVERSION_SIZE} MB)`);
-          console.warn(`⚠️ Using original video to prevent out-of-memory error`);
-        }
-
-        // Convert video to standard H.264 MP4 (fixes iPhone HEVC videos)
-        let conversionAttempted = false;
-        if (shouldAttemptConversion) {
-          try {
-            console.log('🔄 Attempting video conversion to H.264 MP4...');
-            const convertedBody = await convertVideoToStandardMP4(body, original);
-          
-            // Check if conversion actually happened (not just returned original)
-            if (convertedBody !== body) {
-              body = convertedBody;
-              conversionAttempted = true;
-              console.log(`✅ Conversion successful (${(body.length / 1024 / 1024).toFixed(2)} MB)`);
-            } else {
-              console.warn('⚠️ Using original video (FFmpeg not available or conversion skipped)');
-            }
-          } catch (conversionError) {
-            console.warn('⚠️ Video conversion failed, using original video:', conversionError.message);
-            // Don't fail - try with original video instead
-            // The Replicate model might handle it
-          }
-        } else {
-          console.log('⚠️ Skipping conversion (file too large for 512MB RAM limit)');
-        }
-
-        // Upload video to S3 (converted or original)
-        const ext = conversionAttempted ? 'mp4' : (original.split(".").pop() || "mp4").toLowerCase();
-        const key = `tiktok-uploads/${crypto.randomUUID()}.${ext}`;
-
-        await s3.send(new PutObjectCommand({
-          Bucket: S3_BUCKET,
-          Key: key,
-          Body: body,
-          ContentType: "video/mp4"
-        }));
-
-        const base = PUBLIC_BASE_URL.replace(/\/$/, "");
-        const videoUrl = `${base}/${key}`;
-
-        // Create Replicate prediction for captions
-        // Using autocaption - adds karaoke-style captions to video (perfect for TikTok!)
-        const tiktokReplicate = new Replicate({ auth: REPLICATE_API_TOKEN });
-        
-        // Create Replicate prediction with fictions-ai/autocaption
-        console.log(`🎬 TikTok captions: ${videoUrl}`);
-        console.log(`📏 Caption size: ${captionSettings.size} words`);
-        console.log(`📝 Text color: ${captionSettings.textColor}`);
-        console.log(`🎨 Highlight color: ${captionSettings.highlightColor}`);
-        
-        // Map caption size (words) to max_chars (characters per line)
-        // 15 words ≈ 12 chars, 50 words ≈ 16 chars, 70 words ≈ 20 chars
-        const maxChars = Math.min(Math.max(Math.floor(12 + (captionSettings.size - 15) * 0.15), 12), 20);
-        
-        // NOTE: fictions-ai/autocaption currently doesn't support custom text/highlight colors
-        // These settings are stored for future compatibility or alternative models
-        const prediction = await tiktokReplicate.predictions.create({
-          version: "18a45ff0d95feb4449d192bbdc06b4a6df168fa33def76dfc51b78ae224b599b",
-          input: {
-            video_file_input: videoUrl,
-            font_size: 6,
-            subs_position: "bottom",
-            max_chars: maxChars,
-            output_video_format: "mp4",
-            video_width: null,  // Auto-detect dimensions
-            video_height: null  // Auto-detect dimensions
-            // text_color and highlight_color not yet supported by this model
-          }
-        });
-        
-        console.log(`✅ Prediction ${prediction.id} created | max_chars: ${maxChars}`);
-
-        // Save to videos table for dashboard history
-        await pool.query(
-          `INSERT INTO videos (email, prediction_id, status, input_url, cost_credits, type)
-           VALUES ($1, $2, $3, $4, $5, $6)
-           ON CONFLICT (prediction_id) DO UPDATE SET
-             status = EXCLUDED.status,
-             updated_at = now()`,
-          [email, prediction.id, prediction.status, videoUrl, TIKTOK_COST, 'tiktok_captions']
-        );
-
-        res.json({
-          jobId: prediction.id,
-          status: prediction.status
-        });
-
-      } catch (e) {
-        console.error("TikTok captions error:", e);
-        
-        // Refund credits if generation failed after charging
-        try {
-          await pool.query(
-            "UPDATE users SET balance = balance + $1 WHERE email = $2",
-            [TIKTOK_COST, email]
-          );
-          console.log(`Refunded ${TIKTOK_COST} credits to ${email} due to error`);
-        } catch (refundErr) {
-          console.error("Failed to refund credits:", refundErr);
-        }
-        
-        res.status(e.statusCode || 500).json({ 
-          error: e?.message || "Failed to generate captions" 
-        });
-      }
-    });
-
-    req.pipe(bb);
+    const { rows } = await pool.query(
+      `SELECT id, slug, title, excerpt, cover_url, video_url, published_at
+       FROM blog_posts
+       WHERE status='published'
+       ORDER BY published_at DESC NULLS LAST, created_at DESC
+       LIMIT 50`
+    );
+    res.json({ posts: rows });
   } catch (e) {
-    console.error("TikTok captions error:", e);
-    res.status(e.statusCode || 500).json({ error: e?.message || "Internal error" });
+    console.error(e);
+    res.status(500).json({ error: "Could not load posts" });
   }
 });
 
-/**
- * GET /api/tiktok-captions/:jobId
- * Check status of caption generation
- */
-app.get("/api/tiktok-captions/:jobId", auth, asyncHandler(async (req, res) => {
-  const { jobId } = req.params;
-
-  // Query Replicate directly
-  requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
-  const replicate = new Replicate({ auth: REPLICATE_API_TOKEN });
-  
-  const prediction = await replicate.predictions.get(jobId);
-
-  // Update database with latest status and output
-  if (prediction.status === 'succeeded' && prediction.output) {
-    const outputUrl = Array.isArray(prediction.output) ? prediction.output[0] : prediction.output;
-    
-    await pool.query(
-      `UPDATE videos 
-       SET status = $1, output_url = $2, updated_at = now() 
-       WHERE prediction_id = $3`,
-      [prediction.status, outputUrl, jobId]
-    );
-  } else if (prediction.status === 'failed' || prediction.status === 'canceled') {
-    await pool.query(
-      `UPDATE videos 
-       SET status = $1, updated_at = now() 
-       WHERE prediction_id = $2`,
-      [prediction.status, jobId]
-    );
-    
-    // Automatically refund credits for failed generation
-    await refundCreditsForFailure(jobId);
-    
-    // Log the error for debugging
-    console.error(`❌ TikTok captions job ${jobId} failed:`, prediction.error || 'No error details');
-  }
-
-  res.json({
-    status: prediction.status,
-    output: prediction.output,
-    error: prediction.error || null,     // Include error details if failed
-    logs: prediction.logs || null,       // Include logs for debugging
-    progress: prediction.progress || null // Include progress if available
-  });
-}));
-
-// ========================================
-// KLING AI VIDEO GENERATOR API
-// ========================================
-
-/**
- * POST /api/kling-video
- * Generate AI video from text or image
- * Cost: 20 credits per second (5s = 100 credits, 10s = 200 credits)
- */
-app.post("/api/kling-video", auth, (req, res) => {
+app.get("/api/blog/posts/:slug", async (req, res) => {
   try {
-    requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
-    
-    requireEnv("S3_ENDPOINT", S3_ENDPOINT);
-    requireEnv("S3_ACCESS_KEY_ID", S3_ACCESS_KEY_ID);
-    requireEnv("S3_SECRET_ACCESS_KEY", S3_SECRET_ACCESS_KEY);
-    requireEnv("S3_BUCKET", S3_BUCKET);
-    requireEnv("PUBLIC_BASE_URL", PUBLIC_BASE_URL);
-
-    const KLING_COST_PER_SECOND = 20;
-    const bb = Busboy({
-      headers: req.headers,
-      limits: {
-        fileSize: 10 * 1024 * 1024, // 10MB for images
-        files: 1
-      }
-    });
-
-    const fields = {};
-    let imageFile = null;
-    let imageBuffer = null;
-
-    bb.on("field", (name, val) => {
-      fields[name] = val;
-    });
-
-    bb.on("file", (name, file, info) => {
-      if (name === "image") {
-        const chunks = [];
-        file.on("data", chunk => chunks.push(chunk));
-        file.on("end", () => {
-          imageBuffer = Buffer.concat(chunks);
-          imageFile = {
-            buffer: imageBuffer,
-            filename: info.filename || `image_${Date.now()}.png`,
-            mimetype: info.mimeType || "image/png"
-          };
-        });
-      } else {
-        file.resume(); // Drain unwanted files
-      }
-    });
-
-    bb.on("finish", async () => {
-      try {
-        const { email } = req.user;
-        const { prompt, mode, duration, aspectRatio } = fields;
-
-        if (!prompt) {
-          return res.status(400).json({ error: "Prompt is required" });
-        }
-
-        if (mode !== "text" && mode !== "image") {
-          return res.status(400).json({ error: "Invalid mode" });
-        }
-
-        if (mode === "image" && !imageFile) {
-          return res.status(400).json({ error: "Image is required for image-to-video mode" });
-        }
-
-        // Calculate cost based on duration (15 credits per second)
-        const videoDuration = parseInt(duration) || 10;
-        const KLING_COST = videoDuration * KLING_COST_PER_SECOND;
-
-        // Check user balance
-        const balRes = await pool.query(
-          "SELECT balance FROM users WHERE email = $1",
-          [email]
-        );
-        
-        if (!balRes.rows.length) {
-          return res.status(404).json({ error: "USER_NOT_FOUND" });
-        }
-
-        const currentBalance = balRes.rows[0].balance || 0;
-        
-        if (currentBalance < KLING_COST) {
-          return res.status(402).json({ 
-            error: "INSUFFICIENT_BALANCE",
-            required: KLING_COST,
-            current: currentBalance
-          });
-        }
-
-        // Deduct credits immediately
-        await pool.query(
-          "UPDATE users SET balance = balance - $1 WHERE email = $2",
-          [KLING_COST, email]
-        );
-
-        console.log(`Deducted ${KLING_COST} credits from ${email} for ${videoDuration}s video`);
-
-        // Upload image to S3 if needed
-        let imageUrl = null;
-        
-        if (mode === "image" && imageFile) {
-          // Convert HEIC to JPEG if needed
-          let finalBuffer = imageFile.buffer;
-          let finalMimetype = imageFile.mimetype;
-          let finalFilename = imageFile.filename;
-          
-          // Check if image is HEIC/HEIF format
-          const isHEIC = imageFile.mimetype?.toLowerCase().includes('heic') || 
-                         imageFile.mimetype?.toLowerCase().includes('heif') ||
-                         imageFile.filename?.toLowerCase().endsWith('.heic') ||
-                         imageFile.filename?.toLowerCase().endsWith('.heif');
-          
-          if (isHEIC) {
-            try {
-              console.log('🔄 Detected HEIC image, converting to JPEG...');
-              finalBuffer = await convertHEICtoJPEG(imageFile.buffer, imageFile.filename);
-              finalMimetype = 'image/jpeg';
-              finalFilename = imageFile.filename.replace(/\.(heic|heif)$/i, '.jpg');
-              console.log('✅ HEIC converted to JPEG successfully');
-            } catch (conversionError) {
-              console.error('❌ HEIC conversion failed:', conversionError.message);
-              return res.status(400).json({ 
-                error: "Failed to convert HEIC image. Please convert to JPG/PNG first." 
-              });
-            }
-          }
-          
-          const s3 = new S3Client({
-            endpoint: S3_ENDPOINT,
-            region: "auto",
-            credentials: {
-              accessKeyId: S3_ACCESS_KEY_ID,
-              secretAccessKey: S3_SECRET_ACCESS_KEY
-            }
-          });
-
-          const key = `kling-inputs/${Date.now()}_${finalFilename}`;
-          
-          await s3.send(new PutObjectCommand({
-            Bucket: S3_BUCKET,
-            Key: key,
-            Body: finalBuffer,
-            ContentType: finalMimetype
-          }));
-
-          imageUrl = `${PUBLIC_BASE_URL}/${key}`;
-          console.log(`Uploaded input image: ${imageUrl}`);
-        }
-
-        // Call Kling API via Replicate
-        const klingReplicate = new Replicate({ auth: REPLICATE_API_TOKEN });
-        
-        const input = {
-          prompt: prompt,
-          duration: parseInt(duration) || 10,
-          aspect_ratio: aspectRatio || "16:9"
-        };
-
-        // Add image if in image mode
-        if (mode === "image" && imageUrl) {
-          input.start_image = imageUrl;
-        }
-
-        const prediction = await klingReplicate.predictions.create({
-          version: "939cd1851c5b112f284681b57ee9b0f36d0f913ba97de5845a7eef92d52837df",
-          input: input
-        });
-
-        console.log("Kling prediction created:", prediction.id);
-
-        // Store in database
-        await pool.query(
-          `INSERT INTO videos (email, prediction_id, status, input_url, cost_credits, type) 
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [email, prediction.id, prediction.status, imageUrl || null, KLING_COST, 'kling_video']
-        );
-
-        res.json({
-          jobId: prediction.id,
-          status: prediction.status
-        });
-
-      } catch (e) {
-        console.error("Kling video error:", e);
-        
-        // Refund credits if generation failed after charging
-        try {
-          const { email: userEmail } = req.user;
-          const videoDuration = parseInt(fields.duration) || 10;
-          const refundAmount = videoDuration * KLING_COST_PER_SECOND;
-          await pool.query(
-            "UPDATE users SET balance = balance + $1 WHERE email = $2",
-            [refundAmount, userEmail]
-          );
-          console.log(`Refunded ${refundAmount} credits to ${userEmail} due to error`);
-        } catch (refundErr) {
-          console.error("Failed to refund credits:", refundErr);
-        }
-
-        res.status(500).json({ error: e?.message || "Video generation failed" });
-      }
-    });
-
-    req.pipe(bb);
-
+    const slug = String(req.params.slug || "");
+    const { rows } = await pool.query(
+      `SELECT id, slug, title, excerpt, content_html, cover_url, video_url, published_at
+       FROM blog_posts
+       WHERE slug=$1 AND status='published'
+       LIMIT 1`,
+      [slug]
+    );
+    const post = rows[0];
+    if (!post) return res.status(404).json({ error: "Not found" });
+    res.json({ post });
   } catch (e) {
-    console.error("Kling video error:", e);
-    res.status(e.statusCode || 500).json({ error: e?.message || "Internal error" });
+    console.error(e);
+    res.status(500).json({ error: "Could not load post" });
   }
 });
 
-/**
- * GET /api/kling-video/:jobId
- * Check status of video generation
- */
-app.get("/api/kling-video/:jobId", auth, asyncHandler(async (req, res) => {
-  const { jobId } = req.params;
-
-  // Query Replicate directly
-  requireEnv("REPLICATE_API_TOKEN", REPLICATE_API_TOKEN);
-  const replicate = new Replicate({ auth: REPLICATE_API_TOKEN });
-  
-  const prediction = await replicate.predictions.get(jobId);
-
-  // Update database with latest status and output
-  if (prediction.status === 'succeeded' && prediction.output) {
-    const outputUrl = Array.isArray(prediction.output) ? prediction.output[0] : prediction.output;
-    
-    await pool.query(
-      `UPDATE videos 
-       SET status = $1, output_url = $2, updated_at = now() 
-       WHERE prediction_id = $3`,
-      [prediction.status, outputUrl, jobId]
+/* ---------------------------
+   BLOG (admin)
+---------------------------- */
+app.get("/api/admin/blog/posts", auth, requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, slug, title, excerpt, status, published_at, created_at, updated_at
+       FROM blog_posts
+       ORDER BY created_at DESC
+       LIMIT 200`
     );
-  } else if (prediction.status === 'failed' || prediction.status === 'canceled') {
-    await pool.query(
-      `UPDATE videos 
-       SET status = $1, updated_at = now() 
-       WHERE prediction_id = $2`,
-      [prediction.status, jobId]
-    );
-    
-    // Automatically refund credits for failed generation
-    await refundCreditsForFailure(jobId);
+    res.json({ posts: rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Could not load admin posts" });
   }
+});
 
-  res.json({
-    status: prediction.status,
-    output: prediction.output
-  });
-}));
+
+app.get("/api/admin/blog/posts/:id", auth, requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!id) return res.status(400).json({ error: "Bad id" });
+    const { rows } = await pool.query(
+      `SELECT id, slug, title, excerpt, content_html, cover_url, video_url, status, published_at, created_at, updated_at
+       FROM blog_posts
+       WHERE id=$1
+       LIMIT 1`,
+      [id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: "Not found" });
+    res.json({ post: rows[0] });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Could not load post" });
+  }
+});
+
+
+app.post("/api/admin/blog/posts", auth, requireAdmin, async (req, res) => {
+  try {
+    const { slug, title, excerpt, content_html, cover_url, video_url, status } = req.body || {};
+    if (!slug || !title || !content_html) return res.status(400).json({ error: "Missing slug, title, or content" });
+    const st = (status === "published") ? "published" : "draft";
+    const publishedAt = st === "published" ? new Date() : null;
+
+    const { rows } = await pool.query(
+      `INSERT INTO blog_posts (slug, title, excerpt, content_html, cover_url, video_url, status, published_at, author_email)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       RETURNING id, slug, title, excerpt, status, published_at`,
+      [slug, title, excerpt || null, content_html, cover_url || null, video_url || null, st, publishedAt, req.user.email || null]
+    );
+    res.json({ post: rows[0] });
+  } catch (e) {
+    console.error(e);
+    const msg = String(e?.message || "");
+    if (msg.includes("duplicate key")) return res.status(409).json({ error: "Slug already exists" });
+    res.status(500).json({ error: "Could not create post" });
+  }
+});
+
+app.put("/api/admin/blog/posts/:id", auth, requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { slug, title, excerpt, content_html, cover_url, video_url, status } = req.body || {};
+    if (!id || !slug || !title || !content_html) return res.status(400).json({ error: "Missing fields" });
+
+    const st = (status === "published") ? "published" : "draft";
+    const publishedAt = st === "published" ? (req.body.published_at ? new Date(req.body.published_at) : new Date()) : null;
+
+    const { rows } = await pool.query(
+      `UPDATE blog_posts
+       SET slug=$1, title=$2, excerpt=$3, content_html=$4, cover_url=$5, video_url=$6,
+           status=$7, published_at=$8, updated_at=NOW()
+       WHERE id=$9
+       RETURNING id, slug, title, excerpt, status, published_at`,
+      [slug, title, excerpt || null, content_html, cover_url || null, video_url || null, st, publishedAt, id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: "Not found" });
+    res.json({ post: rows[0] });
+  } catch (e) {
+    console.error(e);
+    const msg = String(e?.message || "");
+    if (msg.includes("duplicate key")) return res.status(409).json({ error: "Slug already exists" });
+    res.status(500).json({ error: "Could not update post" });
+  }
+});
+
+app.delete("/api/admin/blog/posts/:id", auth, requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!id) return res.status(400).json({ error: "Bad id" });
+    await pool.query(`DELETE FROM blog_posts WHERE id=$1`, [id]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Could not delete post" });
+  }
+});
 
